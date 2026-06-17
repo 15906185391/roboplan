@@ -495,6 +495,81 @@ void Scene::computeFrameJacobian(const Eigen::VectorXd& q, pinocchio::FrameIndex
   pinocchio::computeFrameJacobian(model_, model_data_, q, frame_id, reference_frame, jacobian);
 }
 
+void Scene::computeRelativeFrameJacobian(const Eigen::VectorXd& q, pinocchio::FrameIndex frame_id,
+                                         const std::string& base_frame,
+                                         pinocchio::ReferenceFrame reference_frame,
+                                         Eigen::Ref<Eigen::MatrixXd> jacobian) const {
+  const auto maybe_base_id = getFrameId(base_frame);
+  if (!maybe_base_id) {
+    throw std::runtime_error("Failed to get base frame ID: " + maybe_base_id.error());
+  }
+  const pinocchio::FrameIndex base_id = maybe_base_id.value();
+
+  // Compute both Jacobians in LOCAL_WORLD_ALIGNED (world orientation, body origin).
+  // This avoids toActionMatrix() convention issues between Pinocchio versions.
+  Eigen::MatrixXd J_ee_lwa = Eigen::MatrixXd::Zero(6, model_.nv);
+  Eigen::MatrixXd J_base_lwa = Eigen::MatrixXd::Zero(6, model_.nv);
+  pinocchio::computeFrameJacobian(model_, model_data_, q, frame_id, pinocchio::LOCAL_WORLD_ALIGNED,
+                                  J_ee_lwa);
+  pinocchio::computeFrameJacobian(model_, model_data_, q, base_id, pinocchio::LOCAL_WORLD_ALIGNED,
+                                  J_base_lwa);
+
+  // oMf for both frames was populated by the computeFrameJacobian calls above
+  const pinocchio::SE3& T_ee = model_data_.oMf.at(frame_id);
+  const pinocchio::SE3& T_base = model_data_.oMf.at(base_id);
+
+  // World-frame relative Jacobian (at EE origin, world orientation).
+  //
+  // This is the transport theorem for the velocity of a point expressed in a moving
+  // frame: the EE velocity relative to the base equals the EE world velocity minus the
+  // base world velocity minus the rigid-body coupling term omega_base x (p_ee - p_base).
+  // Refs: Siciliano et al., "Robotics: Modelling, Planning and Control", Sec. 3.1.1,
+  // Eq. (3.14); Featherstone, "Rigid Body Dynamics Algorithms", Secs. 2.2 and 2.8.
+  //
+  //   v_rel_lin = v_ee_lin - v_base_lin - omega_base x (p_ee - p_base)
+  //             = J_ee_lwa_lin - J_base_lwa_lin + skew(dp) * J_base_lwa_ang
+  //   omega_rel = J_ee_lwa_ang - J_base_lwa_ang
+  //
+  // where dp = p_ee - p_base and skew(dp)*w = dp x w = -(w x dp).
+  //
+  // Guaranteed properties:
+  //   - Joints upstream of both frames (rigid motion)  -> J_rel = 0.
+  //   - Joints that do not affect the base frame       -> J_rel = J_ee_abs.
+  const Eigen::Vector3d dp = T_ee.translation() - T_base.translation();
+
+  Eigen::MatrixXd J_rel_lwa(6, model_.nv);
+  J_rel_lwa.topRows<3>() =
+      J_ee_lwa.topRows<3>() - J_base_lwa.topRows<3>() +
+      (Eigen::Matrix3d() << 0., -dp.z(), dp.y(), dp.z(), 0., -dp.x(), -dp.y(), dp.x(), 0.)
+              .finished() *
+          J_base_lwa.bottomRows<3>();
+  J_rel_lwa.bottomRows<3>() = J_ee_lwa.bottomRows<3>() - J_base_lwa.bottomRows<3>();
+
+  // Convert to the requested reference frame.
+  const pinocchio::SE3 T_rel = T_base.actInv(T_ee);
+  const Eigen::Matrix3d& R_rel = T_rel.rotation();
+
+  switch (reference_frame) {
+  case pinocchio::LOCAL_WORLD_ALIGNED:
+    jacobian = J_rel_lwa;
+    break;
+  case pinocchio::LOCAL:
+    jacobian.topRows<3>() = R_rel.transpose() * J_rel_lwa.topRows<3>();
+    jacobian.bottomRows<3>() = R_rel.transpose() * J_rel_lwa.bottomRows<3>();
+    break;
+  case pinocchio::WORLD: {
+    // Shift from EE origin to world origin: v_world = v_lwa - omega x p_ee.
+    const Eigen::Vector3d& p = T_ee.translation();
+    jacobian.topRows<3>() =
+        J_rel_lwa.topRows<3>() -
+        (Eigen::Matrix3d() << 0., -p.z(), p.y(), p.z(), 0., -p.x(), -p.y(), p.x(), 0.).finished() *
+            J_rel_lwa.bottomRows<3>();
+    jacobian.bottomRows<3>() = J_rel_lwa.bottomRows<3>();
+    break;
+  }
+  }
+}
+
 void Scene::computeJointJacobians(const Eigen::VectorXd& q) const {
   pinocchio::computeJointJacobians(model_, model_data_, q);
 }

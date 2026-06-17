@@ -158,6 +158,68 @@ TEST_F(RoboPlanSceneTest, TestForwardKinematics) {
   EXPECT_TRUE(fk_wrist.isApprox(expected, 1e-6));
 }
 
+TEST_F(RoboPlanSceneTest, TestFrameJacobianSameBaseAndTipIsZero) {
+  // When frame_id == base_frame_id the relative Jacobian must be zero: the EE is
+  // stationary relative to itself regardless of which joints move.
+  Eigen::VectorXd q(6);
+  q << 0.5, -0.5, 1.0, 0.0, 0.3, 0.0;
+
+  const auto maybe_frame_id = scene_->getFrameId("tool0");
+  ASSERT_TRUE(maybe_frame_id.has_value());
+  const pinocchio::FrameIndex frame_id = maybe_frame_id.value();
+
+  for (auto rf : {pinocchio::LOCAL, pinocchio::LOCAL_WORLD_ALIGNED, pinocchio::WORLD}) {
+    Eigen::MatrixXd J = Eigen::MatrixXd::Zero(6, scene_->getModel().nv);
+    scene_->computeRelativeFrameJacobian(q, frame_id, "tool0", rf, J);
+    EXPECT_NEAR(J.norm(), 0.0, kTolerance)
+        << "Relative Jacobian should be zero when base frame == tip frame";
+  }
+}
+
+TEST_F(RoboPlanSceneTest, TestFrameJacobianBaseFrameNumerical) {
+  // Property-based verification of the relative Jacobian for tool0 relative to
+  // wrist_1_link on the UR5. Two mathematically certain properties hold regardless
+  // of reference frame convention:
+  //
+  // 1. Joints UPSTREAM of the base frame (joints 0-3: shoulder_pan, shoulder_lift,
+  //    elbow, wrist_1) move the entire sub-arm rigidly → no relative motion between
+  //    wrist_1_link and tool0 → J_rel[:,0:4] = 0.
+  //
+  // 2. Joints DOWNSTREAM of the base frame (joints 4-5: wrist_2, wrist_3) do not
+  //    affect wrist_1_link at all → J_rel[:,4:6] = J_ee_abs[:,4:6].
+  Eigen::VectorXd q(6);
+  q << 0.5, -0.5, 1.0, 0.2, 0.3, -0.1;
+  const int nv = scene_->getModel().nv;
+
+  const auto maybe_ee_id = scene_->getFrameId("tool0");
+  const auto maybe_base_id = scene_->getFrameId("wrist_1_link");
+  ASSERT_TRUE(maybe_ee_id.has_value());
+  ASSERT_TRUE(maybe_base_id.has_value());
+  const pinocchio::FrameIndex ee_id = maybe_ee_id.value();
+
+  // Relative Jacobian (tool0 relative to wrist_1_link)
+  Eigen::MatrixXd J_rel = Eigen::MatrixXd::Zero(6, nv);
+  scene_->computeRelativeFrameJacobian(q, ee_id, "wrist_1_link", pinocchio::LOCAL_WORLD_ALIGNED,
+                                       J_rel);
+
+  // Absolute EE Jacobian (no base frame)
+  Eigen::MatrixXd J_ee = Eigen::MatrixXd::Zero(6, nv);
+  scene_->computeFrameJacobian(q, ee_id, pinocchio::LOCAL_WORLD_ALIGNED, J_ee);
+
+  // Property 1: upstream joints (0-3) → zero relative Jacobian columns.
+  EXPECT_NEAR(J_rel.leftCols(4).norm(), 0.0, kTolerance)
+      << "Joints upstream of the base frame should produce zero relative Jacobian.\n"
+      << "J_rel.leftCols(4):\n"
+      << J_rel.leftCols(4);
+
+  // Property 2: downstream joints (4-5) → relative Jacobian == absolute EE Jacobian.
+  EXPECT_TRUE(J_rel.rightCols(2).isApprox(J_ee.rightCols(2), kTolerance))
+      << "Joints between base and EE should give J_rel == J_ee_abs.\n"
+      << "J_rel.rightCols(2):\n"
+      << J_rel.rightCols(2) << "\nJ_ee.rightCols(2):\n"
+      << J_ee.rightCols(2);
+}
+
 TEST_F(RoboPlanSceneTest, TestLoadXMLStrings) {
   // Load the sample XMLs from file as strings.
   auto urdf_xml = readFile(urdf_path_);
