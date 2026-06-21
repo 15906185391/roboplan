@@ -10,6 +10,7 @@
 #include <roboplan/core/scene.hpp>
 #include <roboplan_oink/barriers/position_barrier.hpp>
 #include <roboplan_oink/barriers/self_collision_barrier.hpp>
+#include <roboplan_oink/constraints/acceleration_limit.hpp>
 #include <roboplan_oink/constraints/position_limit.hpp>
 #include <roboplan_oink/constraints/velocity_limit.hpp>
 #include <roboplan_oink/optimal_ik.hpp>
@@ -90,7 +91,9 @@ void init_optimal_ik(nanobind::module_& m) {
            "oink"_a, "target_q"_a, "joint_weights"_a, "options"_a = ConfigurationTaskOptions{})
       .def_rw("target_q", &ConfigurationTask::target_q, "Target joint configuration.")
       .def_rw("joint_weights", &ConfigurationTask::joint_weights,
-              "Weights for each joint in the configuration task.");
+              "Weights for each joint in the configuration task.")
+      .def("setTargetConfiguration", &ConfigurationTask::setTargetConfiguration, "target"_a,
+           "Sets the target joint configuration for this task, for runtime retargeting.");
 
   // Bind the abstract Constraints base class
   nanobind::class_<Constraints>(m, "Constraints", "Abstract base class for IK constraints.");
@@ -109,6 +112,25 @@ void init_optimal_ik(nanobind::module_& m) {
            "v_max"_a)
       .def_rw("dt", &VelocityLimit::dt, "Time step for velocity calculation.")
       .def_rw("v_max", &VelocityLimit::v_max, "Maximum joint velocities.");
+
+  // Bind AccelerationLimit constraint
+  nanobind::class_<AccelerationLimit, Constraints>(
+      m, "AccelerationLimit",
+      "Constraint to enforce joint acceleration limits by bounding the change in velocity\n"
+      "between successive IK steps (plus a braking-distance term toward position limits).\n"
+      "Inspired by pink.limits.AccelerationLimit.")
+      .def(nanobind::init<const Oink&, double, const Eigen::VectorXd&>(), "oink"_a, "dt"_a,
+           "a_max"_a, "Create an acceleration limit with per-joint maximum accelerations.")
+      .def("setLastVelocity", &AccelerationLimit::setLastVelocity, "v_prev"_a,
+           "Record the velocity integrated on the previous step (Delta_q_prev = v_prev * dt,\n"
+           "reusing the constraint's dt). Call once per control step before solving so the\n"
+           "acceleration bound is centered on the previous velocity.")
+      .def("reset", &AccelerationLimit::reset,
+           "Reset the previous-step displacement to zero (e.g. when the robot is at rest).")
+      .def_rw("dt", &AccelerationLimit::dt, "Time step for acceleration calculation.")
+      .def_rw("a_max", &AccelerationLimit::a_max, "Maximum joint accelerations.")
+      .def_rw("Delta_q_prev", &AccelerationLimit::Delta_q_prev,
+              "Displacement applied on the previous step.");
 
   // Bind the abstract Barrier base class
   nanobind::class_<Barrier>(m, "Barrier", "Abstract base class for Control Barrier Functions.")
