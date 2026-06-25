@@ -1,0 +1,142 @@
+name: Build PyPI wheels
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  check_version:
+    name: Check package version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Read package metadata
+        id: package
+        run: |
+          python -m pip install --upgrade "setuptools-scm>=8"
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          from pathlib import Path
+
+          from setuptools_scm import get_version
+
+          pyproject = tomllib.loads(Path("pyproject.toml").read_text())
+          project = pyproject["project"]
+          if project["name"] != "roboplan":
+              raise SystemExit(f"Unexpected package name: {project['name']}")
+          if "version" in project:
+              raise SystemExit("pyproject.toml must use git-derived dynamic versioning")
+          if project.get("dynamic") != ["version"]:
+              raise SystemExit("pyproject.toml must declare dynamic = ['version']")
+          print(f"version={get_version(root='.', local_scheme='no-local-version')}")
+          PY
+      - name: Check tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if ! [[ "$RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag $RELEASE_TAG must use N.N.N format"
+            exit 1
+          fi
+          if [ "$RELEASE_TAG" != "$PACKAGE_VERSION" ]; then
+            echo "::error::Tag $RELEASE_TAG does not match package version $PACKAGE_VERSION"
+            exit 1
+          fi
+
+  build_sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    needs: check_version
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist
+        run: |
+          rm -rf dist
+          python -m pip install --upgrade build twine
+          python -m build --sdist
+          python -m twine check dist/*.tar.gz
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions-sdist
+          path: dist/roboplan-*.tar.gz
+          if-no-files-found: error
+
+  build_wheels:
+    name: Build ${{ matrix.name }} wheels
+    runs-on: ${{ matrix.os }}
+    needs: check_version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            archs: x86_64
+            artifact: linux-x86_64
+            extra_environment: ""
+          - name: Linux aarch64
+            os: ubuntu-24.04-arm
+            archs: aarch64
+            artifact: linux-aarch64
+            extra_environment: ""
+          - name: macOS arm64
+            os: macos-14
+            archs: arm64
+            artifact: macos-arm64
+            extra_environment: "MACOSX_DEPLOYMENT_TARGET=14.0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v4.1.0
+        env:
+          CIBW_ARCHS: ${{ matrix.archs }}
+          CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_SKIP: "pp* *-musllinux*"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
+          CIBW_ENVIRONMENT: >-
+            CMAKE_BUILD_PARALLEL_LEVEL=2
+            MAKEFLAGS="-j2"
+            NINJAFLAGS="-j2"
+            ${{ matrix.extra_environment }}
+          CIBW_TEST_COMMAND: >-
+            python -c "import roboplan; import roboplan.core; import roboplan.filters; import roboplan.example_models;
+            import roboplan.simple_ik; import roboplan.optimal_ik; import roboplan.rrt;
+            import roboplan.toppra; import roboplan.cartesian_planning; print('roboplan imports ok')"
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions-${{ matrix.artifact }}
+          path: wheelhouse/roboplan-*.whl
+          if-no-files-found: error

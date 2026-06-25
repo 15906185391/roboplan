@@ -9,5 +9,9 @@
 .pixi
 *.egg-info
 
+# Python packaging artifacts
+dist/
+wheelhouse/
+
 # Benchmarking results
 pytest_benchmarks.json
