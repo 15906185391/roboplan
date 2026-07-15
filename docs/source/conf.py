@@ -51,6 +51,7 @@ extensions = [
     "sphinx.ext.autosummary",
     "sphinx_rtd_theme",
     "sphinx_copybutton",
+    "sphinxcontrib.mermaid",
     "breathe",
 ]
 
@@ -74,6 +75,11 @@ autodoc_typehints = "description"
 #
 html_theme = "sphinx_rtd_theme"
 master_doc = "index"
+
+# Add any paths that contain custom static files (such as style sheets) here,
+# relative to this directory.
+html_static_path = ["_static"]
+html_css_files = ["custom.css"]
 
 # -- Options for breathe -----------------------------------------------------
 breathe_default_project = "roboplan"
