@@ -1,8 +1,17 @@
 cmake_minimum_required(VERSION 3.22)
 project(roboplan_toppra VERSION 0.5.1)
 
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+  # clang-cl remaps plain -Wall to MSVC /Wall (clang's -Weverything); use the
+  # /clang: prefix to pass the GNU-style flags through unchanged.
+  add_compile_options(/clang:-Wall /clang:-Wextra /clang:-Wpedantic)
+elseif(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
+# Windows: auto-export all symbols so DLLs get import libraries.
+if(WIN32)
+  set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 endif()
 
 # Find dependencies.
@@ -15,19 +24,39 @@ find_package(roboplan REQUIRED)
 find_package(ament_cmake QUIET)
 
 # If toppra is not found, fetch it from GitHub.
+# The find is skipped on Windows: the conda-forge win-64 libtoppra package is
+# missing its import library, and its broken CMake export aborts the
+# configure, so toppra is always built from source there.
 include(FetchContent)
-find_package(toppra QUIET)
+if(NOT WIN32)
+    find_package(toppra QUIET)
+endif()
 if(NOT toppra_FOUND)
     message(STATUS "toppra not found. Fetching from GitHub...")
     set(BUILD_TESTS OFF CACHE BOOL "Disable toppra tests" FORCE)
     set(PYTHON_BINDINGS OFF CACHE BOOL "Disable toppra Python bindings" FORCE)
+    # On Windows, build toppra statically: its install rules place the DLL in
+    # lib/, which is not on the loader search path.
+    # This can be removed when https://github.com/hungpham2511/toppra/pull/294 is released.
+    if(WIN32)
+        set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    endif()
     FetchContent_Declare(
         toppra
         GIT_REPOSITORY https://github.com/hungpham2511/toppra.git
         GIT_TAG 0.6.8
         SOURCE_SUBDIR cpp
     )
+    # toppra maps the deprecated BUILD_TESTS variable onto BUILD_TESTING with
+    # a forced cache write, which would silently disable this package's own
+    # tests below, so restore the previous value afterwards.
+    if(DEFINED CACHE{BUILD_TESTING})
+        set(roboplan_prev_build_testing "$CACHE{BUILD_TESTING}")
+    else()
+        set(roboplan_prev_build_testing ON)
+    endif()
     FetchContent_MakeAvailable(toppra)
+    set(BUILD_TESTING "${roboplan_prev_build_testing}" CACHE BOOL "" FORCE)
 
     # toppra creates non-namespaced targets when built via FetchContent,
     # so we will make an alias to correct this.

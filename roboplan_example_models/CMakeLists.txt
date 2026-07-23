@@ -1,8 +1,17 @@
 cmake_minimum_required(VERSION 3.22)
 project(roboplan_example_models VERSION 0.5.1)
 
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+  # clang-cl remaps plain -Wall to MSVC /Wall (clang's -Weverything); use the
+  # /clang: prefix to pass the GNU-style flags through unchanged.
+  add_compile_options(/clang:-Wall /clang:-Wextra /clang:-Wpedantic)
+elseif(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
+# Windows: auto-export all symbols so DLLs get import libraries.
+if(WIN32)
+  set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 endif()
 
 # Find dependencies.
@@ -13,13 +22,24 @@ endif()
 # issues with symlink installs.
 find_package(ament_cmake QUIET)
 
+# dladdr() in src/resources.cpp comes from dlfcn.h, which is POSIX-only.
+# On Windows the dlfcn-win32 library provides a compatible implementation.
+if(WIN32)
+  find_package(dlfcn-win32 REQUIRED)
+endif()
+
 # Build and install the library containing the resource paths.
 add_library(roboplan_example_models SHARED
     src/resources.cpp
     src/anchor.cpp
 )
+if(WIN32)
+  target_link_libraries(roboplan_example_models PRIVATE dlfcn-win32::dl)
+endif()
+# Forward slashes keep the define a valid C string literal on Windows.
+file(TO_CMAKE_PATH "${CMAKE_INSTALL_PREFIX}" roboplan_install_prefix)
 target_compile_definitions(roboplan_example_models PRIVATE
-  ROBOPLAN_INSTALL_PREFIX="${CMAKE_INSTALL_PREFIX}")
+  ROBOPLAN_INSTALL_PREFIX="${roboplan_install_prefix}")
 target_include_directories(roboplan_example_models PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
@@ -32,6 +52,8 @@ install(
   roboplan_example_models
   EXPORT roboplan_example_models-targets
   LIBRARY DESTINATION lib
+  ARCHIVE DESTINATION lib
+  RUNTIME DESTINATION bin
   INCLUDES DESTINATION include
 )
 
@@ -74,6 +96,8 @@ install(EXPORT roboplan_example_models-targets
 install(TARGETS roboplan_example_models
         EXPORT roboplan_example_models
         LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib
+        RUNTIME DESTINATION bin
         INCLUDES DESTINATION include
         )
 

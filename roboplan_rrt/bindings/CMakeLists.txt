@@ -56,7 +56,9 @@ if(AMENT_BUILD)
 elseif(SKBUILD)
   set(PYTHON_DESTINATION ".")
 else()
-  set(PYTHON_DESTINATION "${Python_SITEARCH}")
+  # TO_CMAKE_PATH converts Windows backslashes, which would otherwise become
+  # invalid escape sequences in the generated cmake_install.cmake.
+  file(TO_CMAKE_PATH "${Python_SITEARCH}" PYTHON_DESTINATION)
 endif()
 
 install(TARGETS _rrt_ext LIBRARY DESTINATION "${PYTHON_DESTINATION}/roboplan/rrt")
@@ -66,7 +68,15 @@ install(TARGETS _rrt_ext LIBRARY DESTINATION "${PYTHON_DESTINATION}/roboplan/rrt
 # which imports roboplan.core, so roboplan-core must be importable at build time
 # (it is, via site-packages in the wheel/colcon build). Older nanobind versions
 # (from rosdep on some distros) do not provide nanobind_add_stub.
-option(GENERATE_PYTHON_STUBS "Generate .pyi stubs for the Python bindings" ON)
+# Default OFF on Windows: stub generation imports the extension from the build
+# tree, where the DLLs it depends on are not yet on the loader search path.
+# The committed stubs are generated on Unix.
+if(WIN32)
+  set(generate_stubs_default OFF)
+else()
+  set(generate_stubs_default ON)
+endif()
+option(GENERATE_PYTHON_STUBS "Generate .pyi stubs for the Python bindings" ${generate_stubs_default})
 if(GENERATE_PYTHON_STUBS AND NOT COMMAND nanobind_add_stub)
   message(WARNING
     "Skipping Python stub generation: the installed nanobind version does not "
