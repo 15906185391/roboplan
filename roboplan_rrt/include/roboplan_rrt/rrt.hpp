@@ -13,6 +13,7 @@
 #include <roboplan/core/collision_context.hpp>
 #include <roboplan/core/scene.hpp>
 #include <roboplan/core/types.hpp>
+#include <roboplan_rrt/constraints.hpp>
 #include <roboplan_rrt/graph.hpp>
 
 namespace roboplan {
@@ -35,6 +36,10 @@ struct RRTOptions {
   double collision_check_step_size = 0.05;
 
   /// @brief If true, uses bisection instead of linear search for collision checking along edges.
+  /// @details Both check the same number of samples on a collision-free edge, so this only changes
+  /// how quickly collision is found: linear walks out from the start, while bisection probes the
+  /// middle first and usually rejects in fewer checks. That makes it roughly free in an empty
+  /// scene, and much faster on average in a cluttered one, which is why it is the default.
   bool collision_check_use_bisection = true;
 
   /// @brief The probability of sampling the goal node instead of a random node.
@@ -48,12 +53,10 @@ struct RRTOptions {
   /// @brief If true, use the RRT-Connect algorithm to grow the search trees.
   bool rrt_connect = false;
 
-  /// @brief If true, use the RRT* algorithm to grow asymptotically optimal trees.
-  /// @details As new nodes are added, RRT* picks the lowest-cost parent among nearby nodes and
-  /// rewires nearby nodes through the new node when that lowers their cost. Unlike plain RRT, it
-  /// does not stop at the first solution: it keeps sampling and rewiring until the node or time
-  /// budget is exhausted, then returns the lowest-cost path found. Compatible with `rrt_connect`,
-  /// in which case both trees are rewired.
+  /// @brief If true, use the RRT* algorithm to grow asymptotically optimal trees by rewiring.
+  /// @details This is compatible with `rrt_connect`, in which case both trees are rewired.
+  /// Works well alongside constraints, and is worth enabling there, especially since
+  /// path shortcutting should not be used in this case as it will likely violate constraints.
   bool rrt_star = false;
 
   /// @brief The configuration-space radius used to find neighbors for RRT* rewiring.
@@ -69,6 +72,11 @@ struct RRTOptions {
   /// asymptotically optimal behavior; with plain RRT or RRT-Connect, setting it to false simply
   /// keeps the cheapest path discovered across the whole budget.
   bool fast_return = true;
+
+  /// @brief Options for the projection that pulls sampled configurations onto the constraints.
+  /// @details Only used when `plan` is given constraints. Its `path_step_size` is the distance the
+  /// tree grows between projections, and is the main tuning parameter for constrained planning.
+  ConstraintProjectorOptions constraint_projection = ConstraintProjectorOptions();
 };
 
 /// @brief Motion planner based on the Rapidly-exploring Random Tree (RRT) algorithm.
@@ -79,12 +87,22 @@ public:
   /// @param options A struct containing RRT options.
   RRT(const std::shared_ptr<Scene> scene, const RRTOptions& options);
 
+  /// @brief Sets or updates the options for the RRT planner.
+  /// @details If the group name is different between the previous and incoming sets of
+  /// options, a new dynotree state space will be generated.
+  /// @param options The new options for the planner.
+  void setOptions(const RRTOptions& options);
+
   /// @brief Plan a path from start to goal.
   /// @param start The starting joint configuration.
   /// @param goal The goal joint configuration.
+  /// @param constraints Constraints that every configuration on the path must satisfy via
+  /// projection, which is the CBiRRT2 constrained extension (Berenson et al., 2009).
+  /// If empty (default), plans without constraints.
   /// @return A joint-space path, if planning succeeds, otherwise an error message.
-  tl::expected<JointPath, std::string> plan(const JointConfiguration& start,
-                                            const JointConfiguration& goal);
+  tl::expected<JointPath, std::string>
+  plan(const JointConfiguration& start, const JointConfiguration& goal,
+       const std::vector<std::shared_ptr<Constraint>>& constraints = {});
 
   /// @brief Sets the seed for the random number generator (RNG).
   /// @details For reproducibility, this also seeds the underlying scene.
@@ -106,8 +124,8 @@ public:
   /// @param q_sample The configuration to extend towards (or connect to).
   /// @param collision_context This plan's private collision context, used for all collision checks.
   /// @param greedy If true (the RRT-Connect CONNECT step), repeatedly extend toward `q_sample`
-  /// until it is reached or an obstacle is hit. If false (a single EXTEND step), add at most one
-  /// node, one `max_connection_distance` step toward `q_sample`.
+  /// until it is reached or an obstacle is hit. If false (a single EXTEND step), stop once
+  /// `max_connection_distance` of progress has been made.
   /// @return True if node(s) were added to the tree, false otherwise.
   bool growTree(KdTree& tree, std::vector<Node>& nodes, const Eigen::VectorXd& q_sample,
                 const CollisionContext& collision_context, bool greedy);
@@ -148,6 +166,13 @@ private:
   /// @return The extended configuration.
   Eigen::VectorXd extend(const Eigen::VectorXd& q_start, const Eigen::VectorXd& q_goal,
                          double max_connection_dist);
+
+  /// @brief Checks whether a straight-line edge in configuration space satisfies constraints.
+  /// @details This is always true when planning without constraints.
+  /// @param q_start The starting joint positions.
+  /// @param q_end The ending joint positions.
+  /// @return True if the edge's interior satisfies the constraints.
+  bool edgeSatisfiesConstraints(const Eigen::VectorXd& q_start, const Eigen::VectorXd& q_end);
 
   /// @brief Finds the IDs of all nodes in a tree within `rewire_distance` (in configuration
   /// distance) of a configuration.
@@ -218,6 +243,9 @@ private:
 
   /// @brief The goal tree nodes.
   std::vector<Node> goal_nodes_;
+
+  /// @brief The projector for the constraints, if any.
+  std::optional<ConstraintProjector> constraint_projector_;
 };
 
 }  // namespace roboplan

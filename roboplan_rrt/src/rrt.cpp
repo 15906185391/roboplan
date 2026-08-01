@@ -10,8 +10,16 @@
 
 namespace roboplan {
 
-RRT::RRT(const std::shared_ptr<Scene> scene, const RRTOptions& options)
-    : scene_{scene}, options_{options} {
+RRT::RRT(const std::shared_ptr<Scene> scene, const RRTOptions& options) : scene_{scene} {
+  setOptions(options);
+};
+
+void RRT::setOptions(const RRTOptions& options) {
+  const bool group_unchanged = (options.group_name == options_.group_name);
+  options_ = options;  // Always update the options
+  if (group_unchanged) {
+    return;  // If the group was unchanged, no need to reinitialize.
+  }
 
   // Validate the joint group.
   const auto maybe_joint_group_info = scene_->getJointGroupInfo(options.group_name);
@@ -73,10 +81,11 @@ RRT::RRT(const std::shared_ptr<Scene> scene, const RRTOptions& options)
                              std::to_string(maybe_collapsed_pos->size()) + ") for group '" +
                              options_.group_name + "'.");
   }
-};
+}
 
-tl::expected<JointPath, std::string> RRT::plan(const JointConfiguration& start,
-                                               const JointConfiguration& goal) {
+tl::expected<JointPath, std::string>
+RRT::plan(const JointConfiguration& start, const JointConfiguration& goal,
+          const std::vector<std::shared_ptr<Constraint>>& constraints) {
   // Record the start for measuring timeouts.
   const auto start_time = std::chrono::steady_clock::now();
 
@@ -84,6 +93,19 @@ tl::expected<JointPath, std::string> RRT::plan(const JointConfiguration& start,
   auto q_start = scene_->toFullJointPositions(options_.group_name, start.positions);
   auto q_goal = scene_->toFullJointPositions(options_.group_name, goal.positions);
   auto q_sample = q_start;
+
+  // Set up constraint projection for this plan, if any constraints were requested. Everything
+  // downstream keys off whether this holds a value.
+  constraint_projector_.reset();
+  if (!constraints.empty()) {
+    try {
+      constraint_projector_.emplace(scene_, options_.group_name, constraints,
+                                    options_.constraint_projection);
+    } catch (const std::exception& ex) {
+      return tl::make_unexpected(std::string("Could not set up constraint projection: ") +
+                                 ex.what());
+    }
+  }
 
   // Snapshot the scene's collision geometry into this plan's private context. All collision checks
   // below route through it, so this plan() call never contends on the Scene's shared collision
@@ -104,13 +126,28 @@ tl::expected<JointPath, std::string> RRT::plan(const JointConfiguration& start,
     return tl::make_unexpected("Goal configuration is in collision, cannot plan!");
   }
 
+  // The trees are rooted at the start and goal, so a path can only stay on the constraints if
+  // those two configurations already do. Projecting them here would silently move the endpoints
+  // the caller asked for, so report it instead and let them project first.
+  if (constraint_projector_.has_value()) {
+    if (!constraint_projector_->satisfies(q_start)) {
+      return tl::make_unexpected("Start configuration does not satisfy the constraints, cannot "
+                                 "plan! Project it onto the constraints first.");
+    }
+    if (!constraint_projector_->satisfies(q_goal)) {
+      return tl::make_unexpected("Goal configuration does not satisfy the constraints, cannot "
+                                 "plan! Project it onto the constraints first.");
+    }
+  }
+
   // Check whether direct connection between the start and goal is possible.
   // Both endpoints were validated as collision-free above, so we only check the interior.
   if ((scene_->configurationDistance(q_start, q_goal) <= options_.max_connection_distance) &&
       (!hasCollisionsAlongPath(*scene_, collision_context, q_start, q_goal,
                                options_.collision_check_step_size,
                                options_.collision_check_use_bisection,
-                               /*check_endpoints*/ false))) {
+                               /*check_endpoints*/ false)) &&
+      edgeSatisfiesConstraints(q_start, q_goal)) {
     return JointPath{.joint_names = joint_group_info_.joint_names,
                      .positions = {q_start(q_indices), q_goal(q_indices)}};
   }
@@ -226,19 +263,56 @@ void RRT::initializeTree(KdTree& tree, std::vector<Node>& nodes, const Eigen::Ve
 
 bool RRT::growTree(KdTree& kd_tree, std::vector<Node>& nodes, const Eigen::VectorXd& q_sample,
                    const CollisionContext& collision_context, bool greedy) {
-  bool grew_tree = false;
   const auto& q_indices = joint_group_info_.q_indices;
+  const bool constrained = constraint_projector_.has_value();
 
-  // Extend from the nearest neighbor to max connection distance.
+  // Unconstrained, one step covers a whole connection. Under constraints the walk takes short hops
+  // instead, because projection is a local operation: a step that is too large lands somewhere it
+  // cannot recover from. Every tree node already satisfies the constraints, so each hop starts on
+  // them and the projection only has to undo the excursion made by that one step.
+  const double step_size = constrained ? options_.constraint_projection.path_step_size
+                                       : options_.max_connection_distance;
+
   const auto& nn = kd_tree.search(collapse(q_sample(q_indices)));
-  const auto& q_nearest = nodes.at(nn.id).config;
-
   int parent_id = nn.id;
-  auto q_current = q_nearest;
+  Eigen::VectorXd q_current = nodes.at(nn.id).config;
 
-  while (true) {
-    // Extend towards the sampled node
-    auto q_extend = extend(q_current, q_sample, options_.max_connection_distance);
+  bool grew_tree = false;
+  double distance_grown = 0.0;
+  double distance_to_sample = scene_->configurationDistance(q_current, q_sample);
+
+  while (distance_to_sample > 0.0) {
+    auto q_extend = extend(q_current, q_sample, step_size);
+
+    // Pull the hop back onto the constraints. A step that lands on the sample is taken as-is when
+    // it already satisfies them, so that reaching another node yields an exact match.
+    // This lets joinTrees stitch the two trees together without a connecting edge. Anything else
+    // is projected, so it lands well inside the tolerances rather than on their boundary.
+    if (constrained && !(q_extend == q_sample && constraint_projector_->satisfies(q_extend)) &&
+        !constraint_projector_->project(q_extend)) {
+      break;
+    }
+
+    // Only a projected step needs measuring. Without one the hop ran straight to the sample,
+    // so it covered exactly what was asked for and left exactly that much less to go.
+    // Measuring it again would just pay for two distance computations per node on the hot path.
+    const auto step_distance = constrained ? scene_->configurationDistance(q_current, q_extend)
+                                           : std::min(step_size, distance_to_sample);
+    const auto distance_from_sample = constrained
+                                          ? scene_->configurationDistance(q_extend, q_sample)
+                                          : distance_to_sample - step_distance;
+    if (constrained) {
+      // Projection pulls the step off the straight line to the sample, and nothing guarantees the
+      // result is any closer to it or even near where the step started. Stop on either, otherwise
+      // the walk can stall against a constraint boundary or splice in an edge long enough that its
+      // interior is no longer meaningfully validated by the checks below. Projection also clamps
+      // to joint limits, but renormalizes continuous and planar rotations rather than clamping
+      // them, so confirm the result is a configuration the planner can use at all.
+      if (distance_from_sample >= distance_to_sample || step_distance > 2.0 * step_size ||
+          !scene_->isValidConfiguration(q_extend)) {
+        break;
+      }
+    }
 
     // If the extended node cannot be connected to the tree then throw it away and return. The new
     // endpoint `q_extend` must be validated; `q_current` is always an existing (known collision-
@@ -247,6 +321,15 @@ bool RRT::growTree(KdTree& kd_tree, std::vector<Node>& nodes, const Eigen::Vecto
                                options_.collision_check_step_size,
                                options_.collision_check_use_bisection,
                                /*check_endpoints*/ true)) {
+      break;
+    }
+
+    // Both ends of a constrained hop sit on the constraints, but the straight segment between them
+    // cuts a corner off a curved set, so its interior drifts slightly outside. The drift grows with
+    // the square of the step and normally stays well inside the tolerances; checking it anyway
+    // makes the guarantee uniform, so every edge of the returned path is validated the same way
+    // whether the constrained extension built it or a tree connection did.
+    if (!edgeSatisfiesConstraints(q_current, q_extend)) {
       break;
     }
 
@@ -259,29 +342,40 @@ bool RRT::growTree(KdTree& kd_tree, std::vector<Node>& nodes, const Eigen::Vecto
       kd_tree.addPoint(collapse(q_extend(q_indices)), new_id);
       // Track cost-to-come when the planner will run to budget, so the cheapest path can be picked.
       // With fast_return the first path is returned, so the cost is unused and left at zero.
-      const double cost =
-          options_.fast_return
-              ? 0.0
-              : nodes.at(parent_id).cost + scene_->configurationDistance(q_current, q_extend);
+      const double cost = options_.fast_return ? 0.0 : nodes.at(parent_id).cost + step_distance;
       nodes.emplace_back(q_extend, parent_id, cost);
     }
 
-    // A plain EXTEND adds a single node; only the greedy CONNECT step keeps extending.
-    if (!greedy) {
-      break;
-    }
-
-    // If we have reached the end point we're done.
-    if (q_extend == q_sample) {
-      break;
-    }
-
-    // Otherwise update the parent and continue extending.
+    distance_grown += step_distance;
     parent_id = new_id;
     q_current = q_extend;
+    distance_to_sample = distance_from_sample;
+
+    if (q_extend == q_sample) {
+      break;  // Reached the sample.
+    }
+    // A plain EXTEND stops once it has covered a connection's worth of ground; only the greedy
+    // CONNECT step keeps walking. Either way, never let one walk consume the whole node budget.
+    if (!greedy && distance_grown >= options_.max_connection_distance) {
+      break;
+    }
+    if (nodes.size() >= options_.max_nodes) {
+      break;
+    }
   }
 
   return grew_tree;
+}
+
+bool RRT::edgeSatisfiesConstraints(const Eigen::VectorXd& q_start, const Eigen::VectorXd& q_end) {
+  if (!constraint_projector_.has_value()) {
+    return true;
+  }
+  // The endpoints are always configurations the planner has already accepted, so only the interior
+  // of the edge needs checking.
+  return constraint_projector_->satisfiesAlongPath(q_start, q_end,
+                                                   options_.collision_check_step_size,
+                                                   /*check_endpoints*/ false);
 }
 
 std::optional<std::pair<JointPath, double>>
@@ -327,13 +421,17 @@ RRT::joinTrees(const std::vector<Node>& nodes, const KdTree& target_tree,
     return build_path(last_added_node, nearest_node, path_cost);
   }
 
-  // Otherwise attempt a normal connection edge between the two nearest nodes.
+  // Otherwise attempt a normal connection edge between the two nearest nodes. Under constraints
+  // this edge is the one piece of the path the constrained extension did not build, so it has to
+  // be verified explicitly; in practice it is rarely needed, because the extension walks right up
+  // to the opposite tree and the exact-match case above fires first.
   const auto connection_distance = scene_->configurationDistance(q_last_added, q_nearest);
   if ((connection_distance <= options_.max_connection_distance) &&
       (!hasCollisionsAlongPath(*scene_, collision_context, q_last_added, q_nearest,
                                options_.collision_check_step_size,
                                options_.collision_check_use_bisection,
-                               /*check_endpoints*/ false))) {
+                               /*check_endpoints*/ false)) &&
+      edgeSatisfiesConstraints(q_last_added, q_nearest)) {
 
     // If the nodes are not the same the total cost-to-come of the joined path is the two
     // connected nodes' costs plus the connecting edge length.
@@ -383,7 +481,8 @@ int RRT::rewire(KdTree& kd_tree, std::vector<Node>& nodes, const Eigen::VectorXd
         !hasCollisionsAlongPath(*scene_, collision_context, q_near, q_new,
                                 options_.collision_check_step_size,
                                 options_.collision_check_use_bisection,
-                                /*check_endpoints*/ false)) {
+                                /*check_endpoints*/ false) &&
+        edgeSatisfiesConstraints(q_near, q_new)) {
       best_cost = candidate_cost;
       best_parent = near_id;
     }
@@ -404,7 +503,8 @@ int RRT::rewire(KdTree& kd_tree, std::vector<Node>& nodes, const Eigen::VectorXd
         !hasCollisionsAlongPath(*scene_, collision_context, q_new, near_node.config,
                                 options_.collision_check_step_size,
                                 options_.collision_check_use_bisection,
-                                /*check_endpoints*/ false)) {
+                                /*check_endpoints*/ false) &&
+        edgeSatisfiesConstraints(q_new, near_node.config)) {
       // Detach from the old parent, attach to the new node, then refresh the subtree's costs.
       auto& old_siblings = nodes.at(near_node.parent_id).children;
       old_siblings.erase(std::remove(old_siblings.begin(), old_siblings.end(), near_id),
