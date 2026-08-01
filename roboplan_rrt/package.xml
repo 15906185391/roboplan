@@ -2,10 +2,14 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>roboplan_rrt</name>
-  <version>0.5.1</version>
+  <version>0.6.0</version>
   <description>Rapidly-Exploring Random Tree (RRT) implementation for RoboPlan.</description>
   <maintainer email="sebas.a.castro@gmail.com">Sebastian Castro</maintainer>
   <license>MIT</license>
+
+  <url type="website">https://roboplan.readthedocs.io</url>
+  <url type="repository">https://github.com/open-planning/roboplan</url>
+  <url type="bugtracker">https://github.com/open-planning/roboplan/issues</url>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <buildtool_depend>ament_cmake_python</buildtool_depend>
