@@ -1,6 +1,7 @@
 install(
   PROGRAMS
   common.py
+  example_runner.py
   example_action_chunk_tracking.py
   example_cartesian_planning.py
   example_constrained_rrt.py
@@ -10,5 +11,6 @@ install(
   example_rrt.py
   example_scene.py
   example_teleop.py
+  roboplan_gui.py
   DESTINATION lib/roboplan_examples
 )

@@ -32,3 +32,16 @@ The main folders found in this repo are as follows.
 <img src="docs/source/media/dual_franka_rrt.gif" alt="Rapidly-exploring random tree (RRT) with dual Franka FR3 arms." width="600">
 
 <img src="docs/source/media/cartesian_planning_ur5.gif" alt="Cartesian path planning with a UR5 arm." width="600">
+
+## PySide6 example workbench
+
+The Python examples in `roboplan_examples/python` can be launched from a small
+PySide6 interface that exposes the common model, planner, IK, tracking, and Viser
+parameters.
+
+```bash
+python roboplan_examples/python/roboplan_gui.py
+```
+
+Each run starts the selected example in a separate Python process, streams its
+output into the GUI, and leaves Viser available at the configured host and port.
