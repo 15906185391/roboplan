@@ -9,6 +9,7 @@ install(
   example_oink_position_barriers.py
   example_oink.py
   example_rrt.py
+  example_toppra_joint_planning.py
   example_scene.py
   example_teleop.py
   roboplan_gui.py

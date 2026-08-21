@@ -106,6 +106,10 @@ ENUM_TYPES = {
         "CartesianSpeedMode",
     ),
     ("example_rrt", "toppra_mode"): ("roboplan.toppra", "SplineFittingMode"),
+    (
+        "example_toppra_joint_planning",
+        "toppra_mode",
+    ): ("roboplan.toppra", "SplineFittingMode"),
 }
 
 
