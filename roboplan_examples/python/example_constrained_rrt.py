@@ -34,6 +34,10 @@ from roboplan.toppra import PathParameterizerTOPPRA, SplineFittingMode, TOPPRAOp
 from roboplan.visualization import addPositionPolyline, visualizeJointTrajectory
 
 
+def _pump_matplotlib(delay: float = 0.001) -> None:
+    plt.pause(delay)
+
+
 # The safe zone the gripper must stay inside, as (min, max) world coordinates in meters.
 ZONE_MIN = np.array([0.30, -0.45, 0.25])
 ZONE_MAX = np.array([0.75, 0.45, 0.70])
@@ -482,6 +486,8 @@ def main(
     # Main display and animation loop.
     plt.figure()
     plt.ion()
+    plt.show(block=False)
+    _pump_matplotlib()
     while True:
         if not metrics_queue.empty():
             fig = plot_metrics(*metrics_queue.get(), tilt_limit)
@@ -489,19 +495,20 @@ def main(
             plt.draw()
             fig.canvas.draw()
             fig.canvas.flush_events()
-            plt.pause(0.1)
+            _pump_matplotlib()
         elif animate and cur_traj is not None:
             print("\nAnimating trajectory...")
             for q in cur_traj.positions:
                 viz.display(scene.toFullJointPositions(group_name, q))
                 time.sleep(traj_dt)
+                _pump_matplotlib()
             viz.display(q_start)
             animate = False
             plan_button.disabled = False
             animate_button.disabled = False
             print("...done!")
         else:
-            time.sleep(0.1)
+            _pump_matplotlib(0.05)
 
 
 if __name__ == "__main__":

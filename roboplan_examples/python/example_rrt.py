@@ -28,6 +28,10 @@ from roboplan.visualization import (
 )
 
 
+def _pump_matplotlib(delay: float = 0.001) -> None:
+    plt.pause(delay)
+
+
 def main(
     model: str = "ur5",
     max_connection_distance: float = 3.0,
@@ -266,6 +270,8 @@ def main(
     # Main display and animation loop.
     plt.figure()
     plt.ion()
+    plt.show(block=False)
+    _pump_matplotlib()
     while True:
         if not traj_queue.empty():
             plt.clf()
@@ -276,19 +282,20 @@ def main(
             plt.draw()
             fig.canvas.draw()
             fig.canvas.flush_events()
-            plt.pause(0.1)
+            _pump_matplotlib()
         elif animate and cur_traj is not None:
             print("Animating trajectory...")
             for q in cur_traj.positions:
                 q_full = scene.toFullJointPositions(model_data.default_joint_group, q)
                 viz.display(q_full)
                 time.sleep(traj_dt)
+                _pump_matplotlib()
             animate = False
             plan_button.disabled = False
             animate_button.disabled = False
             print("...done!")
         else:
-            time.sleep(0.1)
+            _pump_matplotlib(0.05)
 
 
 if __name__ == "__main__":

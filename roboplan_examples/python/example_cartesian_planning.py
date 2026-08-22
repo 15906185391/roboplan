@@ -25,6 +25,10 @@ from roboplan.visualization import (
 )
 
 
+def _pump_matplotlib(delay: float = 0.001) -> None:
+    plt.pause(delay)
+
+
 def round_corners(
     vertices: list[np.ndarray],
     radius: float,
@@ -331,7 +335,7 @@ def main(
     # Show the trajectory plot without blocking so the animation loop can run.
     plt.ion()
     plt.show(block=False)
-    plt.pause(0.2)
+    _pump_matplotlib(0.01)
 
     print("Playing back the trajectory. Press Ctrl+C to exit.")
     try:
@@ -344,6 +348,7 @@ def main(
                 viz.display(q_play)
                 fig.canvas.flush_events()
                 time.sleep(max(0.0, dt - (time.perf_counter() - t_start)))
+                _pump_matplotlib()
             time.sleep(0.5)
     except KeyboardInterrupt:
         pass

@@ -19,6 +19,10 @@ from roboplan.toppra import PathParameterizerTOPPRA, SplineFittingMode, TOPPRAOp
 from roboplan.visualization import plotJointTrajectory, visualizeJointTrajectory
 
 
+def _pump_matplotlib(delay: float = 0.001) -> None:
+    plt.pause(delay)
+
+
 def _make_joint_waypoints(
     scene: Scene,
     group_name: str,
@@ -31,7 +35,8 @@ def _make_joint_waypoints(
         raise ValueError("waypoint_count must be at least 2.")
 
     group_info = scene.getJointGroupInfo(group_name)
-    q_start = collapseContinuousJointPositions(scene, group_name, q_home_full)
+    q_group_home = q_home_full[np.asarray(group_info.q_indices)]
+    q_start = collapseContinuousJointPositions(scene, group_name, q_group_home)
     q_lower, q_upper = scene.getPositionLimitVectors(group_name, collapsed=True)
 
     n_dof = len(q_start)
@@ -65,7 +70,7 @@ def _make_joint_waypoints(
         curve = curve_span * scale
         path = JointPath()
         path.joint_names = list(group_info.joint_names)
-        path.positions = []
+        positions: list[np.ndarray] = []
 
         safe = True
         full_waypoints: list[np.ndarray] = []
@@ -77,23 +82,25 @@ def _make_joint_waypoints(
             if scene.hasCollisions(q_full):
                 safe = False
                 break
-            path.positions.append(q_group.copy())
+            positions.append(q_group.copy())
             full_waypoints.append(q_full.copy())
 
         if safe and len(full_waypoints) == waypoint_count:
+            path.positions = positions
             return path, np.array(full_waypoints)
 
     path = JointPath()
     path.joint_names = list(group_info.joint_names)
-    path.positions = []
+    positions = []
     full_waypoints = []
     q_goal = np.clip(q_start + base_span * primary, q_lower, q_upper)
     for idx in range(waypoint_count):
         s = float(idx) / float(waypoint_count - 1)
         q_group = (1.0 - s) * q_start + s * q_goal
         q_full = scene.toFullJointPositions(group_name, q_group)
-        path.positions.append(q_group.copy())
+        positions.append(q_group.copy())
         full_waypoints.append(q_full.copy())
+    path.positions = positions
     return path, np.array(full_waypoints)
 
 
@@ -109,6 +116,18 @@ def _segment_samples_are_safe(scene: Scene, full_waypoints: np.ndarray, samples:
     return True
 
 
+def _trajectory_samples_are_safe(
+    scene: Scene,
+    group_name: str,
+    positions: list[np.ndarray],
+) -> bool:
+    for q in positions:
+        q_full = scene.toFullJointPositions(group_name, q)
+        if scene.hasCollisions(q_full):
+            return False
+    return True
+
+
 def main(
     model: str = "ur5",
     toppra_mode: SplineFittingMode = SplineFittingMode.Adaptive,
@@ -121,6 +140,7 @@ def main(
     max_adaptive_iterations: int = 10,
     max_adaptive_step_size: float = 0.05,
     max_blend_deviation: float = 0.01,
+    preview_only: bool = False,
     host: str = "localhost",
     port: str = "8000",
 ):
@@ -139,6 +159,7 @@ def main(
         max_adaptive_iterations: Maximum collision-check iterations for adaptive mode.
         max_adaptive_step_size: Maximum step size used to sample adaptive splines.
         max_blend_deviation: Maximum deviation for linear blend corner rounding.
+        preview_only: If True, expose Viser preview controls but keep execution disabled.
         host: The host for the ViserVisualizer.
         port: The port for the ViserVisualizer.
     """
@@ -184,10 +205,9 @@ def main(
         path_span,
         curvature_scale,
     )
-    if not _segment_samples_are_safe(scene, full_waypoints):
-        print(
-            "Warning: sampled path segments touch collision geometry; TOPPRA will still attempt to run."
-        )
+    sparse_path_is_safe = _segment_samples_are_safe(scene, full_waypoints)
+    if not sparse_path_is_safe:
+        print("Warning: sampled path segments touch collision geometry.")
 
     toppra = PathParameterizerTOPPRA(scene, group_name)
     options = TOPPRAOptions(
@@ -207,6 +227,12 @@ def main(
         print(f"TOPPRA failed: {exc}")
         sys.exit(1)
     print(f"Trajectory duration: {traj.times[-1]:.3f} s")
+
+    trajectory_is_safe = _trajectory_samples_are_safe(scene, group_name, traj.positions)
+    if sparse_path_is_safe and trajectory_is_safe:
+        print("Safety check: sampled sparse path and timed trajectory are collision-free.")
+    else:
+        print("Safety check: collision detected in sampled path or timed trajectory.")
 
     visualizeJointTrajectory(
         viz,
@@ -230,18 +256,119 @@ def main(
     )
     fig.canvas.draw()
     fig.canvas.flush_events()
-    plt.pause(0.1)
+    plt.show(block=False)
+    _pump_matplotlib()
 
-    print("Animating trajectory...")
+    print("Use the Viser GUI controls to preview, scrub, reset, or execute the trajectory.")
+    if preview_only:
+        print("Preview-only mode: execution is disabled for this run.")
+    elif not sparse_path_is_safe or not trajectory_is_safe:
+        print("Execution disabled: adjust the plan until safety checks pass.")
+
+    trajectory_positions = list(traj.positions)
+    safety_ok = sparse_path_is_safe and trajectory_is_safe
+    preview_done = False
+    pending_mode: str | None = None
+    animating = False
+
+    def display_step(target_step_idx: int, update_slider: bool = True) -> None:
+        target_step_idx = max(0, min(target_step_idx, len(trajectory_positions) - 1))
+        q_full = scene.toFullJointPositions(group_name, trajectory_positions[target_step_idx])
+        scene.setJointPositions(q_full)
+        viz.display(q_full)
+        if update_slider:
+            step_slider.value = target_step_idx
+
+    status_text = viz.viewer.gui.add_text(
+        "Status",
+        "Ready to preview." if safety_ok else "Collision detected; execution disabled.",
+        disabled=True,
+    )
+    preview_button = viz.viewer.gui.add_button("Preview trajectory")
+    execute_button = viz.viewer.gui.add_button("Execute trajectory")
+    reset_button = viz.viewer.gui.add_button("Reset")
+    step_slider = viz.viewer.gui.add_slider(
+        "Trajectory step",
+        min=0,
+        max=len(trajectory_positions) - 1,
+        step=1,
+        initial_value=0,
+    )
+    execute_button.disabled = True
+
+    @preview_button.on_click
+    def preview_trajectory(_):
+        nonlocal pending_mode
+        if animating:
+            return
+        pending_mode = "preview"
+
+    @execute_button.on_click
+    def execute_trajectory(_):
+        nonlocal pending_mode
+        if animating:
+            return
+        if preview_only or not safety_ok or not preview_done:
+            return
+        pending_mode = "execute"
+
+    @reset_button.on_click
+    def reset(_):
+        if animating:
+            return
+        display_step(0)
+        status_text.value = "Reset to trajectory start."
+
+    @step_slider.on_update
+    def update_step_from_slider(_):
+        if animating:
+            return
+        display_step(int(step_slider.value), update_slider=False)
+        status_text.value = f"Preview step {int(step_slider.value)} / {len(trajectory_positions) - 1}."
+
+    display_step(0)
     try:
-        for q in traj.positions:
-            q_full = scene.toFullJointPositions(group_name, q)
-            scene.setJointPositions(q_full)
-            viz.display(q_full)
-            time.sleep(dt)
-        print("Animation complete. Close the window or stop the process to exit.")
         while True:
-            time.sleep(10.0)
+            if pending_mode is None:
+                time.sleep(0.1)
+                continue
+
+            mode = pending_mode
+            pending_mode = None
+            animating = True
+            preview_button.disabled = True
+            execute_button.disabled = True
+            reset_button.disabled = True
+            step_slider.disabled = True
+
+            if mode == "preview":
+                status_text.value = "Previewing trajectory in Viser."
+                print("Previewing trajectory in Viser...")
+            else:
+                status_text.value = "Executing approved trajectory."
+                print("Executing approved trajectory...")
+
+            start_idx = int(step_slider.value)
+            if start_idx >= len(trajectory_positions) - 1:
+                start_idx = 0
+            for idx in range(start_idx, len(trajectory_positions)):
+                display_step(idx)
+                time.sleep(dt)
+                _pump_matplotlib()
+
+            animating = False
+            if mode == "preview":
+                preview_done = True
+                status_text.value = "Preview complete; execution is available." if safety_ok and not preview_only else "Preview complete."
+                print("Preview complete.")
+            else:
+                status_text.value = "Execution complete."
+                print("Execution complete.")
+
+            preview_button.disabled = False
+            reset_button.disabled = False
+            step_slider.disabled = False
+            execute_button.disabled = preview_only or not safety_ok or not preview_done
     except KeyboardInterrupt:
         pass
 
