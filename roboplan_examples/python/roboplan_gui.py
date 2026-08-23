@@ -12,6 +12,43 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+
+def _append_env_tokens(name: str, tokens: tuple[str, ...]) -> None:
+    existing = os.environ.get(name, "")
+    parts = existing.split() if existing else []
+    for token in tokens:
+        if token not in parts:
+            parts.append(token)
+    os.environ[name] = " ".join(parts)
+
+
+def _append_qt_logging_rules(rules: tuple[str, ...]) -> None:
+    existing = os.environ.get("QT_LOGGING_RULES", "")
+    parts = [part for part in existing.split(";") if part]
+    for rule in rules:
+        if rule not in parts:
+            parts.append(rule)
+    os.environ["QT_LOGGING_RULES"] = ";".join(parts)
+
+
+def _configure_qt_webengine_logging() -> None:
+    _append_env_tokens(
+        "QTWEBENGINE_CHROMIUM_FLAGS",
+        (
+            "--disable-logging",
+            "--log-level=3",
+        ),
+    )
+    _append_qt_logging_rules(
+        (
+            "qt.webenginecontext.debug=false",
+            "qt.webenginecontext.info=false",
+        ),
+    )
+
+
+_configure_qt_webengine_logging()
+
 from PySide6.QtCore import QAbstractAnimation, QEasingCurve, QProcess, QProcessEnvironment, QPropertyAnimation, QSize, QTimer, Qt, QUrl
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFontDatabase, QKeySequence, QTextCursor
 from PySide6.QtWidgets import (
@@ -48,9 +85,23 @@ from PySide6.QtWidgets import (
 )
 
 try:
+    from PySide6.QtWebEngineCore import QWebEnginePage
     from PySide6.QtWebEngineWidgets import QWebEngineView
 except ImportError:  # pragma: no cover - optional GUI extra.
+    QWebEnginePage = None
     QWebEngineView = None
+
+
+if QWebEnginePage is not None:
+
+    class QuietWebEnginePage(QWebEnginePage):
+        def javaScriptConsoleMessage(self, level, message, line_number, source_id):
+            if "THREE.THREE.Clock" in message or "THREE.Clock" in message:
+                return
+            super().javaScriptConsoleMessage(level, message, line_number, source_id)
+
+else:
+    QuietWebEnginePage = None
 
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
@@ -95,9 +146,9 @@ EXAMPLE_DESC_ZH = {
     "example_ik": "带可拖拽末端标记的交互式逆运动学。",
     "example_oink": "带可拖拽 Viser 目标和可选碰撞约束的 OInK 伺服循环。",
     "example_oink_position_barriers": "带控制屏障函数位置安全约束的 OInK。",
-    "example_rrt": "采样无碰撞起止状态，使用 RRT 规划，再做时间参数化和动画播放。",
+    "example_rrt": "拖拽末端目标后使用 RRT 规划，再做时间参数化和动画播放。",
     "example_toppra_joint_planning": "生成平滑的关节空间路点路径，并用 TOPPRA 做时间参数化。",
-    "example_constrained_rrt": "规划保持夹爪竖直并位于安全区域内的路径。",
+    "example_constrained_rrt": "拖拽末端目标后规划保持夹爪竖直并位于安全区域内的路径。",
     "example_cartesian_planning": "通过可拖拽的 Viser 目标规划锯齿形笛卡尔路径，同时绘制生成的关节轨迹。",
     "example_action_chunk_tracking": "通过 OInK 跟踪模拟学习策略生成的笛卡尔或关节动作片段。",
     "example_teleop": "使用键盘指令在终端中遥操作一个或多个末端执行器。",
@@ -480,7 +531,7 @@ EXAMPLES: tuple[ExampleSpec, ...] = (
         "example_rrt",
         "RRT 规划器",
         "Planning",
-        "采样无碰撞起止状态，使用 RRT 规划，再进行时间参数化和动画回放。",
+        "拖拽末端目标后使用 RRT 规划，再进行时间参数化和动画回放。",
         True,
         (
             ParameterSpec("model", "机器人型号", "choice", "ur5", choices=MODEL_CHOICES),
@@ -496,6 +547,7 @@ EXAMPLES: tuple[ExampleSpec, ...] = (
             ParameterSpec("fast_return", "快速返回", "bool", True),
             ParameterSpec("include_shortcutting", "包含捷径优化", "bool", False),
             ParameterSpec("max_shortcutting_iters", "捷径迭代", "int", 100, 1, 10000, 10),
+            ParameterSpec("interactive_goal", "交互目标", "bool", True),
             ParameterSpec(
                 "toppra_mode",
                 "TOPPRA 模式",
@@ -564,7 +616,7 @@ EXAMPLES: tuple[ExampleSpec, ...] = (
         "example_constrained_rrt",
         "约束 RRT",
         "Planning",
-        "规划保持夹爪竖直并位于安全区域内的路径。",
+        "拖拽末端目标后规划保持夹爪竖直并位于安全区域内的路径。",
         True,
         (
             ParameterSpec("model", "机器人型号", "choice", "ur5", choices=SUPPORTED_CONSTRAINED_MODELS),
@@ -577,6 +629,7 @@ EXAMPLES: tuple[ExampleSpec, ...] = (
             ParameterSpec("rrt_star", "RRT*", "bool", True),
             ParameterSpec("rewire_distance", "重连距离", "float", 1.0, 0.01, 20.0, 0.1),
             ParameterSpec("rng_seed", "随机种子", "int", 1234, 0, 2**31 - 1, 1),
+            ParameterSpec("interactive_goal", "交互目标", "bool", True),
             *COMMON_VISER_PARAMS,
         ),
     ),
@@ -1079,6 +1132,8 @@ class ExamplePage(QWidget):
         self.viser_view: QWidget | None = None
         if QWebEngineView is not None:
             viewer = QWebEngineView()
+            if QuietWebEnginePage is not None:
+                viewer.setPage(QuietWebEnginePage(viewer))
             viewer.setObjectName("ViserWebView")
             viewer.setUrl(QUrl("about:blank"))
             self.viser_view = viewer

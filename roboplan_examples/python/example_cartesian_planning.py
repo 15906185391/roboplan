@@ -213,12 +213,12 @@ def _run_interactive_cartesian_planning(
 
     status_text = viz.viewer.gui.add_text(
         "Status",
-        "Drag the target frame to preview the robot, then plan the path.",
+        "Drag the target frame, then plan the path.",
         disabled=True,
     )
     solve_stats = viz.viewer.gui.add_text(
         "Solve stats",
-        "Waiting for the first preview solve.",
+        "Waiting for plan-time IK.",
         disabled=True,
     )
     plan_stats = viz.viewer.gui.add_text(
@@ -260,20 +260,17 @@ def _run_interactive_cartesian_planning(
             print(f"Solve stats: {stats}")
 
             if not result:
-                status_text.value = "IK preview failed. Adjust the marker and try again."
+                status_text.value = "IK failed. Adjust the marker and try again."
                 return False
 
             q_preview = scene.toFullJointPositions(group_name, solution.positions)
             scene.setJointPositions(q_preview)
             viz.display(q_preview)
             q_seed.positions = solution.positions
-            status_text.value = "Target updated and robot previewed."
+            status_text.value = "Target solved; planning can continue."
             return True
         finally:
             busy["preview"] = False
-
-    for controls in transform_controls:
-        controls.on_update(lambda _=None: _solve_preview())
 
     reset_button = viz.viewer.gui.add_button("Reset target")
     plan_button = viz.viewer.gui.add_button("Plan trajectory")
@@ -286,8 +283,9 @@ def _run_interactive_cartesian_planning(
             start_pose = scene.forwardKinematics(q_home_full, ee_name)
             controls.position = start_pose[:3, 3]
             controls.wxyz = pin.Quaternion(start_pose[:3, :3]).coeffs()[[3, 0, 1, 2]]
-        _solve_preview()
-        status_text.value = "Target reset to the home pose."
+        scene.setJointPositions(q_home_full)
+        viz.display(q_home_full)
+        status_text.value = "Target reset to the home pose. Drag it or plan directly."
 
     @plan_button.on_click
     def plan_trajectory(_):
@@ -373,7 +371,7 @@ def _run_interactive_cartesian_planning(
             viz.display(scene.toFullJointPositions(group_name, q_group))
             time.sleep(dt)
 
-    _solve_preview()
+    status_text.value = "Ready. Drag the target frame; IK runs when planning starts."
     try:
         while True:
             time.sleep(10.0)

@@ -3,6 +3,7 @@
 import queue
 import sys
 import time
+from collections import deque
 import tyro
 import xacro
 
@@ -215,6 +216,7 @@ def main(
     host: str = "localhost",
     port: str = "8000",
     rng_seed: int = 1234,
+    interactive_goal: bool = True,
 ):
     """
     Plans RRT paths that keep the gripper upright and inside a safe zone.
@@ -244,6 +246,7 @@ def main(
         host: The host for the ViserVisualizer.
         port: The port for the ViserVisualizer.
         rng_seed: The seed for the planner, the scene, and the random goal sampling.
+        interactive_goal: If true, expose a draggable target marker and preview IK before planning.
     """
     model_data = get_model_data().get(model)
     if model_data is None or model not in SUPPORTED_MODELS:
@@ -391,6 +394,247 @@ def main(
     add_marker("/constrained_rrt/start", q_start, (0, 200, 0))
     viz.display(q_start)
     scene.setJointPositions(q_start)
+
+    if interactive_goal:
+        q_goal_full = sample_goal(
+            rng, ik, projector, scene, model_data, upright, q_start, inset
+        )
+        if q_goal_full is None:
+            print("\nCould not sample an initial reachable goal in the safe zone.")
+            sys.exit(1)
+        q_goal_initial_full = q_goal_full.copy()
+        q_goal_solution = JointConfiguration()
+        q_goal_seed = JointConfiguration()
+        q_goal_seed.positions = q_goal_full[q_indices].copy()
+        goal_target = CartesianConfiguration()
+        goal_target.base_frame = model_data.base_link
+        goal_target.tip_frame = ee_name
+        goal_control = viz.viewer.scene.add_transform_controls(
+            "/constrained_rrt/goal",
+            depth_test=False,
+            scale=0.2,
+            disable_sliders=True,
+            visible=True,
+        )
+        goal_pose = scene.forwardKinematics(q_goal_full, ee_name)
+        goal_control.position = goal_pose[:3, 3].copy()
+        goal_control.wxyz = pin.Quaternion(goal_pose[:3, :3]).coeffs()[[3, 0, 1, 2]]
+
+        solve_times = deque(maxlen=30)
+        solve_stats = viz.viewer.gui.add_text(
+            "Solve stats",
+            "Waiting for plan-time IK.",
+            disabled=True,
+        )
+        traj_queue = queue.Queue()
+        metrics_queue = queue.Queue()
+        cur_traj = None
+        animate = False
+        status_text = viz.viewer.gui.add_text(
+            "Status",
+            "Drag the goal marker, then plan the path. IK runs only when planning starts.",
+            disabled=True,
+        )
+        preview_state = {"busy": False, "syncing": False}
+
+        def _sync_goal_control(q_full: np.ndarray) -> None:
+            pose = scene.forwardKinematics(q_full, ee_name)
+            preview_state["syncing"] = True
+            goal_control.position = pose[:3, 3].copy()
+            goal_control.wxyz = pin.Quaternion(pose[:3, :3]).coeffs()[[3, 0, 1, 2]]
+            preview_state["syncing"] = False
+
+        def _update_goal_preview(_=None) -> bool:
+            nonlocal q_goal_full
+            if preview_state["busy"] or preview_state["syncing"]:
+                return False
+            preview_state["busy"] = True
+            try:
+                world_T_base = scene.forwardKinematics(q_start, model_data.base_link)
+                world_T_target = pin.SE3(
+                    pin.Quaternion(goal_control.wxyz[[1, 2, 3, 0]]), goal_control.position
+                ).homogeneous
+                goal_target.tform = np.linalg.inv(world_T_base) @ world_T_target
+
+                q_goal_seed.positions = q_goal_full[q_indices].copy()
+                t_start = time.perf_counter()
+                result = ik.solveIk(goal_target, q_goal_seed, q_goal_solution)
+                elapsed = time.perf_counter() - t_start
+                solve_times.append(elapsed)
+                avg = sum(solve_times) / len(solve_times)
+                freq = 1.0 / avg if avg > 0.0 else 0.0
+                stats = (
+                    f"last {elapsed * 1000.0:.1f} ms | "
+                    f"avg {avg * 1000.0:.1f} ms | "
+                    f"{freq:.1f} Hz"
+                )
+                solve_stats.value = stats
+                print(f"Solve stats: {stats}")
+
+                if not result:
+                    status_text.value = "目标 IK 失败，请拖动标记后重试。"
+                    return False
+
+                q_candidate = scene.toFullJointPositions(
+                    model_data.default_joint_group, q_goal_solution.positions
+                )
+                if not projector.satisfies(q_candidate):
+                    projected = projector.project(q_candidate)
+                    if projected is None:
+                        status_text.value = "目标投影失败，请调整标记位置。"
+                        return False
+                    q_candidate = projected
+
+                q_goal_full = q_candidate.copy()
+                q_goal_solution.positions = q_goal_full[q_indices].copy()
+                q_goal_seed.positions = q_goal_solution.positions
+                _sync_goal_control(q_goal_full)
+                status_text.value = "目标已求解并投影到可行约束内。"
+                return True
+            finally:
+                preview_state["busy"] = False
+
+        plan_stats = viz.viewer.gui.add_text(
+            "Plan stats",
+            "Waiting for the first plan.",
+            disabled=True,
+        )
+        plan_button = viz.viewer.gui.add_button("Plan path")
+        reset_button = viz.viewer.gui.add_button("Reset goal")
+        animate_button = viz.viewer.gui.add_button("Animate trajectory")
+        animate_button.disabled = True
+
+        @reset_button.on_click
+        def reset_goal(_):
+            nonlocal q_goal_full
+            q_goal_full = q_goal_initial_full.copy()
+            goal_pose = scene.forwardKinematics(q_goal_full, ee_name)
+            goal_control.position = goal_pose[:3, 3].copy()
+            goal_control.wxyz = pin.Quaternion(goal_pose[:3, :3]).coeffs()[[3, 0, 1, 2]]
+            scene.setJointPositions(q_start)
+            viz.display(q_start)
+            status_text.value = "Goal reset to the initial sampled pose."
+
+        @plan_button.on_click
+        def plan_path(_):
+            nonlocal animate
+            animate = False
+            plan_button.disabled = True
+            animate_button.disabled = True
+            try:
+                if not _update_goal_preview():
+                    return
+                plan_start = time.perf_counter()
+                q_goal = JointConfiguration()
+                q_goal.positions = q_goal_full[q_indices]
+                print(
+                    f"\nGoal EE position: {scene.forwardKinematics(q_goal_full, ee_name)[:3, 3]}"
+                )
+
+                print("Planning with constraints...")
+                constrained_start = time.perf_counter()
+                try:
+                    path = rrt.plan(start, q_goal, [constraint])
+                except RuntimeError as ex:
+                    print(f"  Constrained planning failed: {ex}")
+                    return
+                constrained_elapsed = time.perf_counter() - constrained_start
+                print(
+                    f"  Found {len(path.positions)} waypoints in {constrained_elapsed:.3f} s"
+                )
+                metrics = measure_path(scene, path, nominal_z, group_name, ee_name)
+                print_metrics("constrained", metrics, tilt_limit, position_slack)
+
+                print("Planning without constraints...")
+                baseline_metrics = None
+                baseline_elapsed = 0.0
+                try:
+                    baseline_start = time.perf_counter()
+                    baseline = rrt.plan(start, q_goal)
+                    baseline_elapsed = time.perf_counter() - baseline_start
+                    print(
+                        f"  Found {len(baseline.positions)} waypoints in {baseline_elapsed:.3f} s"
+                    )
+                    baseline_metrics = measure_path(
+                        scene, baseline, nominal_z, group_name, ee_name
+                    )
+                    print_metrics(
+                        "unconstrained", baseline_metrics, tilt_limit, position_slack
+                    )
+                    addPositionPolyline(
+                        viz,
+                        "/constrained_rrt/unconstrained_path",
+                        baseline_metrics["positions"],
+                        (200, 60, 60),
+                        3.0,
+                    )
+                except RuntimeError as ex:
+                    print(f"  Unconstrained planning failed: {ex}")
+
+                toppra_start = time.perf_counter()
+                traj = toppra.generate(
+                    path, TOPPRAOptions(dt=traj_dt, mode=SplineFittingMode.Adaptive)
+                )
+                toppra_elapsed = time.perf_counter() - toppra_start
+                viz.display(q_start)
+                visualizeJointTrajectory(
+                    viz, scene, traj, [ee_name], (0, 180, 0), "/constrained_rrt/path"
+                )
+
+                total_elapsed = time.perf_counter() - plan_start
+                stats = (
+                    f"constrained {constrained_elapsed:.3f} s | "
+                    f"baseline {baseline_elapsed:.3f} s | "
+                    f"toppra {toppra_elapsed:.3f} s | "
+                    f"total {total_elapsed:.3f} s"
+                )
+                plan_stats.value = stats
+                print(f"Plan stats: {stats}")
+
+                traj_queue.put(traj)
+                metrics_queue.put((metrics, baseline_metrics))
+                status_text.value = "Planning complete. Use Animate trajectory to replay it."
+            finally:
+                plan_button.disabled = False
+                animate_button.disabled = False
+
+        @animate_button.on_click
+        def animate_trajectory(_):
+            nonlocal animate
+            plan_button.disabled = True
+            animate_button.disabled = True
+            animate = True
+
+        add_marker("/constrained_rrt/goal_marker", q_goal_full, (200, 0, 0))
+        status_text.value = "Ready. Drag the goal marker; IK runs when planning starts."
+
+        plt.figure()
+        plt.ion()
+        plt.show(block=False)
+        _pump_matplotlib()
+        while True:
+            if not metrics_queue.empty():
+                fig = plot_metrics(*metrics_queue.get(), tilt_limit)
+                cur_traj = traj_queue.get()
+                plt.draw()
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+                _pump_matplotlib()
+            elif animate and cur_traj is not None:
+                print("\nAnimating trajectory...")
+                for q in cur_traj.positions:
+                    viz.display(scene.toFullJointPositions(group_name, q))
+                    time.sleep(traj_dt)
+                    _pump_matplotlib()
+                viz.display(q_start)
+                animate = False
+                plan_button.disabled = False
+                animate_button.disabled = False
+                print("...done!")
+            else:
+                _pump_matplotlib(0.05)
+
+        return
 
     # Plotting has to happen on the main thread, so the viser callback below hands its results over
     # through these queues rather than drawing from inside the click handler.
