@@ -34,6 +34,7 @@ import sys
 import termios
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -156,6 +157,8 @@ def make_keyboard_listener(state: TeleopKeyboardState) -> keyboard.Listener:
 
 def _suppress_terminal_echo() -> tuple[int, list]:
     """Disable terminal echo so held keys do not flood the terminal output."""
+    if not sys.stdin.isatty():
+        return -1, []
     fd = sys.stdin.fileno()
     old_attrs = termios.tcgetattr(fd)
     new_attrs = termios.tcgetattr(fd)
@@ -371,7 +374,7 @@ def main(
     )
 
     viz = ViserVisualizer(model_pin, collision_model, visual_model)
-    viz.initViewer(open=True, loadModel=True, host=host, port=port)
+    viz.initViewer(open=False, loadModel=True, host=host, port=port)
 
     q_home = get_home_configuration(scene, model_data)
     scene.setJointPositions(q_home)
@@ -418,6 +421,15 @@ def main(
     )
 
     tasks = [*frame_tasks, config_task]
+
+    solve_stats = viz.viewer.gui.add_text(
+        "Solve stats",
+        "Waiting for the first solve.",
+        disabled=True,
+    )
+    solve_times = deque(maxlen=50)
+    loop_times = deque(maxlen=50)
+    last_stats_print = 0.0
 
     # Viser GUI controls.
     linear_slider = viz.viewer.gui.add_slider(
@@ -515,7 +527,7 @@ def main(
 
     try:
         while True:
-            loop_start = time.time()
+            loop_start = time.perf_counter()
 
             # --- GUI-triggered resets ---
             if gui_reset_home.is_set():
@@ -640,11 +652,14 @@ def main(
                 frame_task.setTargetFrameTransform(base_T_world @ target_pose)
 
             # --- Solve OInK and integrate ---
+            solve_start = time.perf_counter()
             try:
                 oink.solveIk(scene, tasks, constraints, delta_q, regularization)
             except RuntimeError as exc:
                 print(f"Warning: OInK failed: {exc}")
                 delta_q[:] = 0.0
+            solve_elapsed = time.perf_counter() - solve_start
+            solve_times.append(solve_elapsed)
 
             delta_q_full[:] = 0.0
             delta_q_full[oink.v_indices] = delta_q
@@ -652,15 +667,35 @@ def main(
             scene.setJointPositions(q_current)
             viz.display(q_current)
 
+            loop_elapsed = time.perf_counter() - loop_start
+            loop_times.append(loop_elapsed)
+            avg_solve = sum(solve_times) / len(solve_times)
+            avg_loop = sum(loop_times) / len(loop_times)
+            solve_hz = 1.0 / avg_solve if avg_solve > 0.0 else 0.0
+            loop_hz = 1.0 / avg_loop if avg_loop > 0.0 else 0.0
+            stats = (
+                f"solve last {solve_elapsed * 1000.0:.1f} ms | "
+                f"avg {avg_solve * 1000.0:.1f} ms | "
+                f"{solve_hz:.1f} Hz; "
+                f"loop avg {avg_loop * 1000.0:.1f} ms | "
+                f"{loop_hz:.1f} Hz"
+            )
+            solve_stats.value = stats
+            now = time.perf_counter()
+            if now - last_stats_print >= 1.0:
+                print(f"Solve stats: {stats}")
+                last_stats_print = now
+
             # --- Maintain control rate ---
-            elapsed = time.time() - loop_start
-            time.sleep(max(0.0, dt - elapsed))
+            sleep_time = max(0.0, dt - loop_elapsed)
+            time.sleep(sleep_time)
 
     except KeyboardInterrupt:
         pass
     finally:
         listener.stop()
-        termios.tcsetattr(fd, termios.TCSADRAIN, _old_term_attrs)
+        if _old_term_attrs:
+            termios.tcsetattr(fd, termios.TCSADRAIN, _old_term_attrs)
         print("Teleop stopped.")
 
 

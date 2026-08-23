@@ -2,6 +2,7 @@
 
 import sys
 import time
+from collections import deque
 import tyro
 import xacro
 
@@ -70,7 +71,7 @@ def main(
     )
 
     viz = ViserVisualizer(model, collision_model, visual_model)
-    viz.initViewer(open=True, loadModel=True, host=host, port=port)
+    viz.initViewer(open=False, loadModel=True, host=host, port=port)
 
     # Set up an IK solver
     options = SimpleIkOptions(
@@ -89,6 +90,12 @@ def main(
     goals = []
     transform_controls = []
     solution = JointConfiguration()
+    solve_times = deque(maxlen=30)
+    solve_stats = viz.viewer.gui.add_text(
+        "Solve stats",
+        "Waiting for the first solve.",
+        disabled=True,
+    )
 
     for ee_name in model_data.ee_names:
         goal = CartesianConfiguration()
@@ -97,6 +104,7 @@ def main(
         goals.append(goal)
 
     def solveIk(_):
+        t_start = time.perf_counter()
         q_full = scene.getCurrentJointPositions()
         world_T_base = scene.forwardKinematics(q_full, model_data.base_link)
         for goal, controls in zip(goals, transform_controls):
@@ -106,6 +114,17 @@ def main(
             goal.tform = np.linalg.inv(world_T_base) @ world_T_target
 
         result = ik_solver.solveIk(goals, start, solution)
+        elapsed = time.perf_counter() - t_start
+        solve_times.append(elapsed)
+        avg = sum(solve_times) / len(solve_times)
+        freq = 1.0 / avg if avg > 0.0 else 0.0
+        stats = (
+            f"last {elapsed * 1000.0:.1f} ms | "
+            f"avg {avg * 1000.0:.1f} ms | "
+            f"{freq:.1f} Hz"
+        )
+        solve_stats.value = stats
+        print(f"Solve stats: {stats}")
         if result:
             q_full = scene.toFullJointPositions(
                 model_data.default_joint_group, solution.positions

@@ -128,6 +128,78 @@ def _trajectory_samples_are_safe(
     return True
 
 
+def _make_goal_joint_waypoints(
+    scene: Scene,
+    group_name: str,
+    q_home_full: np.ndarray,
+    q_goal_group: np.ndarray,
+    waypoint_count: int,
+    curvature_scale: float,
+) -> tuple[JointPath, np.ndarray]:
+    group_info = scene.getJointGroupInfo(group_name)
+    q_start = collapseContinuousJointPositions(
+        scene, group_name, q_home_full[np.asarray(group_info.q_indices)]
+    )
+    q_goal = collapseContinuousJointPositions(scene, group_name, q_goal_group)
+    q_lower, q_upper = scene.getPositionLimitVectors(group_name, collapsed=True)
+
+    delta = q_goal - q_start
+    span = float(np.linalg.norm(delta))
+    if span < 1e-9:
+        primary = np.ones_like(q_start)
+        delta = np.zeros_like(q_start)
+    else:
+        primary = delta / span
+
+    if len(q_start) == 1:
+        secondary = np.ones_like(q_start)
+    else:
+        secondary = np.roll(primary, 1)
+        secondary -= primary * float(secondary @ primary)
+        secondary_norm = float(np.linalg.norm(secondary))
+        if secondary_norm < 1e-9:
+            secondary = np.roll(primary, 2)
+            secondary -= primary * float(secondary @ primary)
+            secondary_norm = float(np.linalg.norm(secondary))
+        secondary = secondary / secondary_norm
+
+    for scale in (1.0, 0.75, 0.5, 0.35, 0.2):
+        curve = span * curvature_scale * scale
+        path = JointPath()
+        path.joint_names = list(group_info.joint_names)
+        positions: list[np.ndarray] = []
+        full_waypoints: list[np.ndarray] = []
+        safe = True
+
+        for idx in range(waypoint_count):
+            s = float(idx) / float(waypoint_count - 1)
+            q_group = q_start + s * delta + np.sin(np.pi * s) * curve * secondary
+            q_group = np.clip(q_group, q_lower, q_upper)
+            q_full = scene.toFullJointPositions(group_name, q_group)
+            if scene.hasCollisions(q_full):
+                safe = False
+                break
+            positions.append(q_group.copy())
+            full_waypoints.append(q_full.copy())
+
+        if safe and len(full_waypoints) == waypoint_count:
+            path.positions = positions
+            return path, np.array(full_waypoints)
+
+    path = JointPath()
+    path.joint_names = list(group_info.joint_names)
+    positions = []
+    full_waypoints = []
+    for idx in range(waypoint_count):
+        s = float(idx) / float(waypoint_count - 1)
+        q_group = (1.0 - s) * q_start + s * q_goal
+        q_full = scene.toFullJointPositions(group_name, q_group)
+        positions.append(q_group.copy())
+        full_waypoints.append(q_full.copy())
+    path.positions = positions
+    return path, np.array(full_waypoints)
+
+
 def main(
     model: str = "ur5",
     toppra_mode: SplineFittingMode = SplineFittingMode.Adaptive,
@@ -141,6 +213,7 @@ def main(
     max_adaptive_step_size: float = 0.05,
     max_blend_deviation: float = 0.01,
     preview_only: bool = False,
+    interactive_goal: bool = True,
     host: str = "localhost",
     port: str = "8000",
 ):
@@ -180,7 +253,7 @@ def main(
         yaml_config_path=model_data.yaml_config_path,
     )
     group_name = model_data.default_joint_group
-
+    group_info = scene.getJointGroupInfo(group_name)
     q_home_full = get_home_configuration(scene, model_data)
     scene.setJointPositions(q_home_full)
 
@@ -193,9 +266,170 @@ def main(
     )
 
     viz = ViserVisualizer(model, collision_model, visual_model)
-    viz.initViewer(open=True, loadModel=True, host=host, port=port)
+    viz.initViewer(open=False, loadModel=True, host=host, port=port)
     viz.display(q_home_full)
     time.sleep(0.1)
+
+    if interactive_goal:
+        q_lower, q_upper = scene.getPositionLimitVectors(group_name, collapsed=True)
+        q_goal = collapseContinuousJointPositions(
+            scene, group_name, q_home_full[np.asarray(group_info.q_indices)]
+        )
+        preview_guard = {"busy": False}
+        preview_solution = JointPath()
+        preview_solution.joint_names = list(group_info.joint_names)
+
+        status_text = viz.viewer.gui.add_text(
+            "Status",
+            "Adjust the joint sliders, then plan the path.",
+            disabled=True,
+        )
+        plan_stats = viz.viewer.gui.add_text(
+            "Plan stats",
+            "Waiting for the first plan.",
+            disabled=True,
+        )
+
+        sliders = []
+        for idx, joint_name in enumerate(group_info.joint_names):
+            limits = scene.getJointInfo(joint_name).limits
+            lo = float(q_lower[idx]) if np.isfinite(q_lower[idx]) else float(limits.min_position)
+            hi = float(q_upper[idx]) if np.isfinite(q_upper[idx]) else float(limits.max_position)
+            if not np.isfinite(lo):
+                lo = -np.pi
+            if not np.isfinite(hi):
+                hi = np.pi
+            initial = float(np.clip(q_goal[idx], lo, hi))
+            slider = viz.viewer.gui.add_slider(
+                f"{joint_name}",
+                min=lo,
+                max=hi,
+                step=max((hi - lo) / 400.0, 0.001),
+                initial_value=initial,
+            )
+            sliders.append(slider)
+
+        def current_goal_group() -> np.ndarray:
+            return np.array([float(slider.value) for slider in sliders], dtype=float)
+
+        def preview_goal(_=None):
+            if preview_guard["busy"]:
+                return
+            q_group = current_goal_group()
+            q_full = scene.toFullJointPositions(group_name, q_group)
+            scene.setJointPositions(q_full)
+            viz.display(q_full)
+            status_text.value = "目标已更新，机器人已预览。"
+
+        for slider in sliders:
+            slider.on_update(preview_goal)
+
+        reset_button = viz.viewer.gui.add_button("Reset Goal")
+        plan_button = viz.viewer.gui.add_button("Plan trajectory")
+        animate_button = viz.viewer.gui.add_button("Animate once")
+        animate_button.disabled = True
+        last_traj: list[np.ndarray] | None = None
+
+        @reset_button.on_click
+        def reset_goal(_):
+            nonlocal q_goal
+            q_goal = collapseContinuousJointPositions(
+                scene, group_name, q_home_full[np.asarray(group_info.q_indices)]
+            )
+            for slider, value in zip(sliders, q_goal):
+                slider.value = float(value)
+            preview_goal()
+            status_text.value = "目标已重置到 home。"
+
+        @plan_button.on_click
+        def plan_path(_):
+            nonlocal last_traj
+            preview_guard["busy"] = True
+            try:
+                preview_goal()
+                q_goal_group = current_goal_group()
+                path, _ = _make_goal_joint_waypoints(
+                    scene,
+                    group_name,
+                    q_home_full,
+                    q_goal_group,
+                    waypoint_count,
+                    curvature_scale,
+                )
+                toppra = PathParameterizerTOPPRA(scene, group_name)
+                options = TOPPRAOptions(
+                    dt=dt,
+                    mode=toppra_mode,
+                    velocity_scale=velocity_scale,
+                    acceleration_scale=acceleration_scale,
+                    max_adaptive_iterations=max_adaptive_iterations,
+                    max_adaptive_step_size=max_adaptive_step_size,
+                    max_blend_deviation=max_blend_deviation,
+                )
+                print(
+                    f"Planning {len(path.positions)} joint-space waypoints with TOPPRA..."
+                )
+                plan_start = time.perf_counter()
+                try:
+                    traj = toppra.generate(path, options)
+                except Exception as exc:
+                    print(f"TOPPRA failed: {exc}")
+                    status_text.value = f"规划失败：{exc}"
+                    return
+                plan_elapsed = time.perf_counter() - plan_start
+                last_traj = list(traj.positions)
+                plan_stats.value = f"toppra {plan_elapsed * 1e3:.1f} ms"
+                print(f"Plan stats: toppra {plan_elapsed * 1e3:.1f} ms")
+                print(f"Trajectory duration: {traj.times[-1]:.3f} s")
+
+                viz.display(q_home_full)
+                visualizeJointTrajectory(
+                    viz,
+                    scene,
+                    traj,
+                    model_data.ee_names,
+                    (0, 140, 220),
+                    "/toppra_joint_space/trajectory",
+                )
+                fig = plotJointTrajectory(
+                    traj,
+                    scene,
+                    group_name=group_name,
+                    title="TOPPRA Joint-Space Trajectory",
+                    positions=True,
+                    velocities=True,
+                    accelerations=True,
+                )
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+                status_text.value = (
+                    "规划完成。若需动画播放，可点击 Animate once。"
+                    if not preview_only
+                    else "预览模式下已生成轨迹。"
+                )
+                animate_button.disabled = preview_only
+                if not preview_only:
+                    for q_group in traj.positions:
+                        viz.display(scene.toFullJointPositions(group_name, q_group))
+                        time.sleep(dt)
+            finally:
+                preview_guard["busy"] = False
+
+        @animate_button.on_click
+        def animate_once(_):
+            if last_traj is None:
+                return
+            for q_group in last_traj:
+                viz.display(scene.toFullJointPositions(group_name, q_group))
+                time.sleep(dt)
+
+        preview_goal()
+        try:
+            while True:
+                time.sleep(10.0)
+        except KeyboardInterrupt:
+            pass
+        return
 
     path, full_waypoints = _make_joint_waypoints(
         scene,
@@ -221,11 +455,14 @@ def main(
     )
 
     print(f"Planning {len(path.positions)} joint-space waypoints with TOPPRA...")
+    plan_start = time.perf_counter()
     try:
         traj = toppra.generate(path, options)
     except Exception as exc:
         print(f"TOPPRA failed: {exc}")
         sys.exit(1)
+    plan_elapsed = time.perf_counter() - plan_start
+    print(f"Plan stats: toppra {plan_elapsed * 1e3:.1f} ms")
     print(f"Trajectory duration: {traj.times[-1]:.3f} s")
 
     trajectory_is_safe = _trajectory_samples_are_safe(scene, group_name, traj.positions)

@@ -362,7 +362,7 @@ def main(
     )
 
     viz = ViserVisualizer(model_pin, collision_model, visual_model)
-    viz.initViewer(open=True, loadModel=True, host=host, port=port)
+    viz.initViewer(open=False, loadModel=True, host=host, port=port)
     viz.display(q_start)
 
     scene.setJointPositions(q_start)

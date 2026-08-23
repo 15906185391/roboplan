@@ -98,7 +98,7 @@ EXAMPLE_DESC_ZH = {
     "example_rrt": "采样无碰撞起止状态，使用 RRT 规划，再做时间参数化和动画播放。",
     "example_toppra_joint_planning": "生成平滑的关节空间路点路径，并用 TOPPRA 做时间参数化。",
     "example_constrained_rrt": "规划保持夹爪竖直并位于安全区域内的路径。",
-    "example_cartesian_planning": "规划并回放锯齿形笛卡尔路径，同时绘制生成的关节轨迹。",
+    "example_cartesian_planning": "通过可拖拽的 Viser 目标规划锯齿形笛卡尔路径，同时绘制生成的关节轨迹。",
     "example_action_chunk_tracking": "通过 OInK 跟踪模拟学习策略生成的笛卡尔或关节动作片段。",
     "example_teleop": "使用键盘指令在终端中遥操作一个或多个末端执行器。",
 }
@@ -156,6 +156,7 @@ PARAM_LABEL_ZH = {
     "path_num_passes": "来回次数",
     "path_corner_radius": "拐角半径",
     "path_corner_arc_step_deg": "拐角弧步长",
+    "interactive_goal": "交互目标",
     "action_space": "动作空间",
     "chunk_horizon": "片段时域",
     "action_scale": "动作缩放",
@@ -320,6 +321,20 @@ def _cmeel_site_packages() -> Path:
         / f"python{sys.version_info.major}.{sys.version_info.minor}"
         / "site-packages"
     )
+
+
+def _shared_library_paths() -> list[str]:
+    purelib = Path(sysconfig.get_paths()["purelib"])
+    paths = [
+        str(Path(sys.prefix) / "lib"),
+        str(purelib / "lib"),
+        str(purelib / "cmeel.prefix" / "lib"),
+    ]
+    unique_paths: list[str] = []
+    for path in paths:
+        if Path(path).exists() and path not in unique_paths:
+            unique_paths.append(path)
+    return unique_paths
 
 
 def _available_models() -> tuple[str, ...]:
@@ -569,7 +584,7 @@ EXAMPLES: tuple[ExampleSpec, ...] = (
         "example_cartesian_planning",
         "笛卡尔规划器",
         "Planning",
-        "规划并回放锯齿形笛卡尔路径，同时绘制生成的关节轨迹。",
+        "通过可拖拽的 Viser 目标规划锯齿形笛卡尔路径，并绘制生成的关节轨迹。",
         True,
         (
             ParameterSpec("model", "机器人型号", "choice", "ur5", choices=MODEL_CHOICES),
@@ -593,6 +608,28 @@ EXAMPLES: tuple[ExampleSpec, ...] = (
             ParameterSpec("path_num_passes", "来回次数", "int", 5, 1, 100, 1),
             ParameterSpec("path_corner_radius", "拐角半径", "float", 0.0, 0.0, 1.0, 0.005),
             ParameterSpec("path_corner_arc_step_deg", "拐角弧步长", "float", 1.0, 0.1, 45.0, 0.5),
+            ParameterSpec("ik_max_iters", "最大迭代", "int", 100, 1, 10000, 10),
+            ParameterSpec("ik_step_size", "步长", "float", 1.0, 0.001, 10.0, 0.05),
+            ParameterSpec(
+                "ik_max_linear_error_norm",
+                "线性误差阈值",
+                "float",
+                0.001,
+                0.0,
+                1.0,
+                0.001,
+            ),
+            ParameterSpec(
+                "ik_max_angular_error_norm",
+                "角度误差阈值",
+                "float",
+                0.001,
+                0.0,
+                1.0,
+                0.001,
+            ),
+            ParameterSpec("ik_check_collisions", "检查碰撞", "bool", True),
+            ParameterSpec("interactive_goal", "交互目标", "bool", True),
             *COMMON_VISER_PARAMS,
         ),
     ),
@@ -976,6 +1013,16 @@ class ExamplePage(QWidget):
         self.status.setObjectName("Status")
         left_layout.addWidget(self.status)
 
+        self.solve_stats = QLabel("求解统计：-")
+        self.solve_stats.setObjectName("SolveStats")
+        self.solve_stats.setWordWrap(True)
+        left_layout.addWidget(self.solve_stats)
+
+        self.plan_stats = QLabel("规划统计：-")
+        self.plan_stats.setObjectName("PlanStats")
+        self.plan_stats.setWordWrap(True)
+        left_layout.addWidget(self.plan_stats)
+
         log_panel = QFrame()
         log_panel.setObjectName("LogPanel")
         log_layout = QVBoxLayout(log_panel)
@@ -1113,6 +1160,12 @@ class ExamplePage(QWidget):
         if current_pythonpath:
             paths.append(current_pythonpath)
         env.insert("PYTHONPATH", os.pathsep.join(paths))
+        current_ld_library_path = env.value("LD_LIBRARY_PATH")
+        lib_paths = _shared_library_paths()
+        if current_ld_library_path:
+            lib_paths.append(current_ld_library_path)
+        if lib_paths:
+            env.insert("LD_LIBRARY_PATH", os.pathsep.join(lib_paths))
         process.setProcessEnvironment(env)
         process.setProcessChannelMode(QProcess.SeparateChannels)
         process.readyReadStandardOutput.connect(self._read_stdout)
@@ -1199,6 +1252,16 @@ class ExamplePage(QWidget):
         cursor.movePosition(QTextCursor.End)
         cursor.insertText(text)
         self.log.setTextCursor(cursor)
+        self.log.ensureCursorVisible()
+        for line in text.splitlines():
+            if line.startswith("Solve stats:"):
+                self.solve_stats.setText(
+                    f"求解统计：{line.removeprefix('Solve stats:').strip()}"
+                )
+            elif line.startswith("Plan stats:"):
+                self.plan_stats.setText(
+                    f"规划统计：{line.removeprefix('Plan stats:').strip()}"
+                )
 
     def _finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
         status = "崩溃" if exit_status == QProcess.CrashExit else "完成"
@@ -1782,6 +1845,20 @@ def main() -> int:
         QLabel#Status {
             color: #637488;
             padding-left: 4px;
+        }
+        QLabel#SolveStats {
+            color: #22506f;
+            background: rgba(235, 244, 251, 0.92);
+            border: 1px solid rgba(197, 215, 231, 0.95);
+            border-radius: 8px;
+            padding: 8px 10px;
+        }
+        QLabel#PlanStats {
+            color: #5a3d1f;
+            background: rgba(250, 241, 229, 0.96);
+            border: 1px solid rgba(230, 210, 188, 0.96);
+            border-radius: 8px;
+            padding: 8px 10px;
         }
         QLabel#SidebarHint {
             color: #627387;

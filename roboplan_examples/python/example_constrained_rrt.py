@@ -284,7 +284,7 @@ def main(
         obstacle.addToPinocchioModels(pin_model, collision_model, visual_model)
 
     viz = ViserVisualizer(pin_model, collision_model, visual_model)
-    viz.initViewer(open=True, loadModel=True, host=host, port=port)
+    viz.initViewer(open=False, loadModel=True, host=host, port=port)
 
     def add_marker(name, q, color):
         """Marks an end effector position with a small sphere."""
@@ -398,6 +398,11 @@ def main(
     metrics_queue = queue.Queue()
     cur_traj = None
     animate = False
+    plan_stats = viz.viewer.gui.add_text(
+        "Plan stats",
+        "Waiting for the first plan.",
+        disabled=True,
+    )
 
     plan_button = viz.viewer.gui.add_button("Plan path")
     animate_button = viz.viewer.gui.add_button("Animate trajectory")
@@ -410,6 +415,7 @@ def main(
         plan_button.disabled = True
         animate_button.disabled = True
         try:
+            plan_start = time.perf_counter()
             q_goal = sample_goal(
                 rng, ik, projector, scene, model_data, upright, q_start, inset
             )
@@ -427,25 +433,28 @@ def main(
             goal.positions = q_goal[q_indices]
 
             print("Planning with constraints...")
-            t_start = time.time()
+            constrained_start = time.perf_counter()
             try:
                 path = rrt.plan(start, goal, [constraint])
             except RuntimeError as ex:
                 print(f"  Constrained planning failed: {ex}")
                 return
-            elapsed = time.time() - t_start
-            print(f"  Found {len(path.positions)} waypoints in {elapsed:.3f} s")
+            constrained_elapsed = time.perf_counter() - constrained_start
+            print(f"  Found {len(path.positions)} waypoints in {constrained_elapsed:.3f} s")
             metrics = measure_path(scene, path, nominal_z, group_name, ee_name)
             print_metrics("constrained", metrics, tilt_limit, position_slack)
 
             # Plan the same problem again with no constraints, for comparison.
             print("Planning without constraints...")
             baseline_metrics = None
-            t_start = time.time()
+            baseline_elapsed = 0.0
             try:
+                baseline_start = time.perf_counter()
                 baseline = rrt.plan(start, goal)
-                elapsed = time.time() - t_start
-                print(f"  Found {len(baseline.positions)} waypoints in {elapsed:.3f} s")
+                baseline_elapsed = time.perf_counter() - baseline_start
+                print(
+                    f"  Found {len(baseline.positions)} waypoints in {baseline_elapsed:.3f} s"
+                )
                 baseline_metrics = measure_path(
                     scene, baseline, nominal_z, group_name, ee_name
                 )
@@ -462,13 +471,25 @@ def main(
             except RuntimeError as ex:
                 print(f"  Unconstrained planning failed: {ex}")
 
+            toppra_start = time.perf_counter()
             traj = toppra.generate(
                 path, TOPPRAOptions(dt=traj_dt, mode=SplineFittingMode.Adaptive)
             )
+            toppra_elapsed = time.perf_counter() - toppra_start
             viz.display(q_start)
             visualizeJointTrajectory(
                 viz, scene, traj, [ee_name], (0, 180, 0), "/constrained_rrt/path"
             )
+
+            total_elapsed = time.perf_counter() - plan_start
+            stats = (
+                f"constrained {constrained_elapsed:.3f} s | "
+                f"baseline {baseline_elapsed:.3f} s | "
+                f"toppra {toppra_elapsed:.3f} s | "
+                f"total {total_elapsed:.3f} s"
+            )
+            plan_stats.value = stats
+            print(f"Plan stats: {stats}")
 
             traj_queue.put(traj)
             metrics_queue.put((metrics, baseline_metrics))

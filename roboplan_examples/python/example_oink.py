@@ -3,6 +3,7 @@
 import sys
 import threading
 import time
+from collections import deque
 import tyro
 import xacro
 
@@ -117,7 +118,7 @@ def main(
     )
 
     viz = ViserVisualizer(model_pin, collision_model, visual_model)
-    viz.initViewer(open=True, loadModel=True, host=host, port=port)
+    viz.initViewer(open=False, loadModel=True, host=host, port=port)
 
     # Set up the Oink solver
     oink = Oink(scene, model_data.default_joint_group)
@@ -253,12 +254,22 @@ def main(
 
     tasks = frame_tasks + [config_task]
 
+    solve_stats = viz.viewer.gui.add_text(
+        "Solve stats",
+        "Waiting for the first solve.",
+        disabled=True,
+    )
+    solve_times = deque(maxlen=50)
+    loop_times = deque(maxlen=50)
+    last_stats_print = 0.0
+
     # Control loop
     running = True
     global paused
     paused = True  # Start paused until user moves marker
 
     def control_loop():
+        nonlocal last_stats_print
         delta_q = np.zeros(num_variables)
         delta_q_target = np.zeros(num_variables)
         delta_q_full = np.zeros(model_pin.nv)
@@ -268,8 +279,9 @@ def main(
         display_period = max(dt, 1.0 / 30.0)
         last_display = 0.0
         while running:
-            loop_start = time.time()
+            loop_start = time.perf_counter()
             q_to_display = None
+            solve_elapsed = 0.0
 
             # Thread-safe scene access for IK solving
             if not paused:
@@ -307,11 +319,14 @@ def main(
                         # Solve the unconstrained task to get the target delta_q for the
                         # acceleration limit. This enables the it to brake towards the
                         # target rather than approaching at full speed and overshooting.
+                        accel_start = time.perf_counter()
                         oink.solveIk(scene, tasks, delta_q_target, regularization)
+                        solve_elapsed += time.perf_counter() - accel_start
                         accel_limit.setTargetDisplacement(delta_q_target)
 
                     # Solve IK for one step with constraints (and the self-collision
                     # barrier when the model has collision pairs).
+                    solve_start = time.perf_counter()
                     try:
                         oink.solveIk(
                             scene, tasks, constraints, barriers, delta_q, regularization
@@ -319,6 +334,8 @@ def main(
                     except RuntimeError as e:
                         delta_q = np.zeros(num_variables)
                         print(f"Warning: IK solver failed: {e}, using zero delta_q")
+                    solve_elapsed += time.perf_counter() - solve_start
+                    solve_times.append(solve_elapsed)
 
                     # Integrate: delta_q is a displacement (already limited by VelocityLimit)
                     delta_q_full[oink.v_indices] = delta_q
@@ -349,9 +366,26 @@ def main(
                 viz.display(q_to_display)
                 last_display = loop_start
 
+            loop_elapsed = time.perf_counter() - loop_start
+            loop_times.append(loop_elapsed)
+            if solve_times:
+                avg_solve = sum(solve_times) / len(solve_times)
+                avg_loop = sum(loop_times) / len(loop_times)
+                stats = (
+                    f"solve last {solve_elapsed * 1000.0:.1f} ms | "
+                    f"avg {avg_solve * 1000.0:.1f} ms | "
+                    f"{(1.0 / avg_solve) if avg_solve > 0.0 else 0.0:.1f} Hz; "
+                    f"loop avg {avg_loop * 1000.0:.1f} ms | "
+                    f"{(1.0 / avg_loop) if avg_loop > 0.0 else 0.0:.1f} Hz"
+                )
+                solve_stats.value = stats
+                now = time.perf_counter()
+                if now - last_stats_print >= 1.0:
+                    print(f"Solve stats: {stats}")
+                    last_stats_print = now
+
             # Maintain control loop rate
-            elapsed = time.time() - loop_start
-            time.sleep(max(0, dt - elapsed))
+            time.sleep(max(0.0, dt - loop_elapsed))
 
     # Start control loop in separate thread
     control_thread = threading.Thread(target=control_loop, daemon=True)

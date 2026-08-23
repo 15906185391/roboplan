@@ -119,7 +119,7 @@ def main(
             obstacle.addToPinocchioModels(model, collision_model, visual_model)
 
     viz = ViserVisualizer(model, collision_model, visual_model)
-    viz.initViewer(open=True, loadModel=True, host=host, port=port)
+    viz.initViewer(open=False, loadModel=True, host=host, port=port)
 
     if include_octrees:
         obstacle = get_octree()
@@ -158,6 +158,11 @@ def main(
     traj_queue = queue.Queue()
     cur_traj = None
     animate = False
+    plan_stats = viz.viewer.gui.add_text(
+        "Plan stats",
+        "Waiting for the first plan.",
+        disabled=True,
+    )
 
     if rng_seed:
         rrt.setRngSeed(rng_seed)
@@ -186,29 +191,39 @@ def main(
         assert goal.positions is not None
 
         print("\nPlanning...")
-        t_start = time.time()
+        plan_start = time.perf_counter()
         try:
             path = rrt.plan(start, goal)
         finally:
             plan_button.disabled = False
             animate_button.disabled = False
-        print(f"Found a path in {time.time() - t_start:.3f} s")
+        plan_elapsed = time.perf_counter() - plan_start
+        shortcut_elapsed = 0.0
 
         # Optionally include path shortening
         if include_shortcutting:
             print("Shortcutting path...")
-            t_start = time.time()
+            shortcut_start = time.perf_counter()
             shortened_path = shortcutter.shortcut(path)
-            print(f"Shortcutted path in {time.time() - t_start:.3f} s")
+            shortcut_elapsed = time.perf_counter() - shortcut_start
 
         # Set up TOPP-RA to time-parameterize the path
         print("Generating trajectory...")
-        t_start = time.time()
+        traj_start = time.perf_counter()
         traj = toppra.generate(
             shortened_path if include_shortcutting else path,
             TOPPRAOptions(dt=traj_dt, mode=toppra_mode),
         )
-        print(f"Generated trajectory in {time.time() - t_start:.3f} s")
+        traj_elapsed = time.perf_counter() - traj_start
+        total_elapsed = plan_elapsed + shortcut_elapsed + traj_elapsed
+        stats = (
+            f"rrt {plan_elapsed:.3f} s | "
+            f"shortcut {shortcut_elapsed:.3f} s | "
+            f"toppra {traj_elapsed:.3f} s | "
+            f"total {total_elapsed:.3f} s"
+        )
+        plan_stats.value = stats
+        print(f"Plan stats: {stats}")
 
         # Visualize the tree and path
         viz.display(q_full)

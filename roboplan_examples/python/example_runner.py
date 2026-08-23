@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
+import ctypes
 import runpy
 import sys
 import sysconfig
@@ -33,6 +35,42 @@ def _add_cmeel_site_packages() -> None:
 
 
 _add_cmeel_site_packages()
+
+
+def _shared_library_roots() -> list[Path]:
+    purelib = Path(sysconfig.get_paths()["purelib"])
+    roots = [
+        Path(sys.prefix) / "lib",
+        purelib / "lib",
+        purelib / "cmeel.prefix" / "lib",
+    ]
+    unique_roots: list[Path] = []
+    for root in roots:
+        if root.exists() and root not in unique_roots:
+            unique_roots.append(root)
+    return unique_roots
+
+
+def _preload_shared_library(name: str) -> bool:
+    for root in _shared_library_roots():
+        candidate = root / name
+        if not candidate.exists():
+            continue
+        ctypes.CDLL(str(candidate), mode=ctypes.RTLD_GLOBAL)
+        return True
+    return False
+
+
+def _preload_runtime_libraries() -> None:
+    for lib_name in ("libtinyxml2.so.11", "libtinyxml2.so.10", "libtinyxml2.so"):
+        try:
+            if _preload_shared_library(lib_name):
+                break
+        except OSError:
+            continue
+
+
+_preload_runtime_libraries()
 
 
 def _install_tyro_import_stub() -> None:
@@ -65,7 +103,7 @@ def _patch_viser_visualizer_port_argument() -> None:
         import time
         import viser
         from pinocchio.visualize import ViserVisualizer
-    except ModuleNotFoundError:
+    except (ModuleNotFoundError, ImportError):
         return
 
     def initViewer(
@@ -148,11 +186,11 @@ def main() -> int:
     }
     try:
         module = importlib.import_module(args.module)
-    except ModuleNotFoundError as exc:
+    except (ModuleNotFoundError, ImportError) as exc:
         print(
-            f"Could not import dependency '{exc.name}'. Make sure the roboplan "
-            "example dependencies are installed in the Python environment that "
-            f"launched this GUI: {sys.executable}",
+            f"Could not import '{args.module}': {exc}. "
+            "Make sure the roboplan example dependencies and shared libraries "
+            f"are installed in the Python environment that launched this GUI: {sys.executable}",
             file=sys.stderr,
         )
         return 1

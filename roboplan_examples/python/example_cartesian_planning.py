@@ -2,6 +2,7 @@
 
 import sys
 import time
+from collections import deque
 import tyro
 import xacro
 
@@ -11,13 +12,14 @@ import pinocchio as pin
 from pinocchio.visualize import ViserVisualizer
 
 from common import get_home_configuration, get_model_data
-from roboplan.core import Scene, JointConfiguration, CartesianPath
+from roboplan.core import CartesianConfiguration, CartesianPath, JointConfiguration, Scene
 from roboplan.example_models import get_package_share_dir
 from roboplan.cartesian_planning import (
     CartesianPathPlanner,
     CartesianPlannerOptions,
     CartesianSpeedMode,
 )
+from roboplan.simple_ik import SimpleIk, SimpleIkOptions
 from roboplan.visualization import (
     plotJointTrajectory,
     visualizeJointTrajectory,
@@ -145,6 +147,240 @@ def make_lawnmower_path(
     return CartesianPath(base_frames, tip_frames, tforms)
 
 
+def _run_interactive_cartesian_planning(
+    scene: Scene,
+    viz: ViserVisualizer,
+    planner: CartesianPathPlanner,
+    model_data,
+    q_home_full: np.ndarray,
+    base_link: str,
+    tip_frames: list[str],
+    path_size: float,
+    path_num_passes: int,
+    path_corner_radius: float,
+    path_corner_arc_step_deg: float,
+    dt: float,
+    max_linear_speed: float,
+    ik_max_iters: int,
+    ik_step_size: float,
+    ik_max_linear_error_norm: float,
+    ik_max_angular_error_norm: float,
+    ik_check_collisions: bool,
+) -> None:
+    group_name = model_data.default_joint_group
+    group_info = scene.getJointGroupInfo(group_name)
+    q_indices = np.asarray(group_info.q_indices)
+
+    q_seed = JointConfiguration()
+    q_seed.positions = q_home_full[q_indices].copy()
+    solution = JointConfiguration()
+
+    ik_solver = SimpleIk(
+        scene,
+        SimpleIkOptions(
+            group_name=group_name,
+            max_iters=ik_max_iters,
+            step_size=ik_step_size,
+            max_linear_error_norm=ik_max_linear_error_norm,
+            max_angular_error_norm=ik_max_angular_error_norm,
+            check_collisions=ik_check_collisions,
+        ),
+    )
+
+    goals: list[CartesianConfiguration] = []
+    transform_controls = []
+    for ee_name in tip_frames:
+        goal = CartesianConfiguration()
+        goal.base_frame = base_link
+        goal.tip_frame = ee_name
+        goals.append(goal)
+
+        start_pose = scene.forwardKinematics(q_home_full, ee_name)
+        controls = viz.viewer.scene.add_transform_controls(
+            f"/cartesian_goal/{ee_name}",
+            depth_test=False,
+            scale=0.2,
+            disable_sliders=True,
+            visible=True,
+        )
+        controls.position = start_pose[:3, 3].copy()
+        controls.wxyz = pin.Quaternion(start_pose[:3, :3]).coeffs()[[3, 0, 1, 2]]
+        transform_controls.append(controls)
+
+    solve_times: deque[float] = deque(maxlen=30)
+    last_traj: list[np.ndarray] | None = None
+    busy = {"preview": False, "plan": False}
+
+    status_text = viz.viewer.gui.add_text(
+        "Status",
+        "Drag the target frame to preview the robot, then plan the path.",
+        disabled=True,
+    )
+    solve_stats = viz.viewer.gui.add_text(
+        "Solve stats",
+        "Waiting for the first preview solve.",
+        disabled=True,
+    )
+    plan_stats = viz.viewer.gui.add_text(
+        "Plan stats",
+        "Waiting for the first plan.",
+        disabled=True,
+    )
+
+    def _solve_preview() -> bool:
+        if busy["plan"]:
+            return False
+        if busy["preview"]:
+            return False
+
+        busy["preview"] = True
+        try:
+            q_current = scene.getCurrentJointPositions()
+            world_T_base = scene.forwardKinematics(q_current, base_link)
+            for goal, controls in zip(goals, transform_controls):
+                world_T_target = pin.SE3(
+                    pin.Quaternion(controls.wxyz[[1, 2, 3, 0]]), controls.position
+                ).homogeneous
+                goal.tform = np.linalg.inv(world_T_base) @ world_T_target
+
+            q_seed.positions = q_current[q_indices].copy()
+            t_start = time.perf_counter()
+            result = ik_solver.solveIk(goals, q_seed, solution)
+            elapsed = time.perf_counter() - t_start
+            solve_times.append(elapsed)
+
+            avg = sum(solve_times) / len(solve_times)
+            freq = 1.0 / avg if avg > 0.0 else 0.0
+            stats = (
+                f"last {elapsed * 1000.0:.1f} ms | "
+                f"avg {avg * 1000.0:.1f} ms | "
+                f"{freq:.1f} Hz"
+            )
+            solve_stats.value = stats
+            print(f"Solve stats: {stats}")
+
+            if not result:
+                status_text.value = "IK preview failed. Adjust the marker and try again."
+                return False
+
+            q_preview = scene.toFullJointPositions(group_name, solution.positions)
+            scene.setJointPositions(q_preview)
+            viz.display(q_preview)
+            q_seed.positions = solution.positions
+            status_text.value = "Target updated and robot previewed."
+            return True
+        finally:
+            busy["preview"] = False
+
+    for controls in transform_controls:
+        controls.on_update(lambda _=None: _solve_preview())
+
+    reset_button = viz.viewer.gui.add_button("Reset target")
+    plan_button = viz.viewer.gui.add_button("Plan trajectory")
+    animate_button = viz.viewer.gui.add_button("Animate once")
+    animate_button.disabled = True
+
+    @reset_button.on_click
+    def reset_target(_):
+        for ee_name, controls in zip(tip_frames, transform_controls):
+            start_pose = scene.forwardKinematics(q_home_full, ee_name)
+            controls.position = start_pose[:3, 3]
+            controls.wxyz = pin.Quaternion(start_pose[:3, :3]).coeffs()[[3, 0, 1, 2]]
+        _solve_preview()
+        status_text.value = "Target reset to the home pose."
+
+    @plan_button.on_click
+    def plan_trajectory(_):
+        nonlocal last_traj
+        if busy["plan"]:
+            return
+        if not _solve_preview():
+            return
+
+        busy["plan"] = True
+        try:
+            q_start_full = scene.getCurrentJointPositions()
+            q_start = JointConfiguration()
+            q_start.positions = q_start_full[q_indices].copy()
+            path = make_lawnmower_path(
+                scene,
+                base_link,
+                tip_frames,
+                q_start_full,
+                path_size=path_size,
+                path_num_passes=path_num_passes,
+                path_corner_radius=path_corner_radius,
+                path_corner_arc_step_deg=path_corner_arc_step_deg,
+                path_corner_min_arc_length=max_linear_speed * dt,
+            )
+
+            print(
+                f"Planning a {path_num_passes}-pass lawnmower over a {path_size} m square "
+                f"Cartesian path for {len(tip_frames)} end-effector(s) "
+                f"({', '.join(tip_frames)})..."
+            )
+            plan_start = time.perf_counter()
+            try:
+                traj = planner.plan(path, q_start)
+            except RuntimeError as exc:
+                print(f"Planning failed: {exc}")
+                status_text.value = f"Planning failed: {exc}"
+                return
+            elapsed = time.perf_counter() - plan_start
+            last_traj = list(traj.positions)
+            plan_stats.value = f"cartesian {elapsed * 1e3:.1f} ms"
+            print(f"Plan stats: cartesian {elapsed * 1e3:.1f} ms")
+            print(f"  Trajectory samples: {len(traj.times)}")
+            print(f"  Trajectory duration: {traj.times[-1]:.3f} s")
+            print(
+                f"  Achieved Cartesian path length: "
+                f"{planner.compute_achieved_path_length(traj, path):.4f} m"
+            )
+            peak_velocity_ratio, peak_acceleration_ratio = planner.compute_peak_limit_ratios(
+                traj
+            )
+            print(f"  Peak velocity / limit:     {peak_velocity_ratio:.2f}")
+            print(f"  Peak acceleration / limit: {peak_acceleration_ratio:.2f}")
+
+            visualizeJointTrajectory(
+                viz,
+                scene,
+                traj,
+                tip_frames,
+                color=(220, 40, 40),
+                name="/interactive_cartesian/actual_path",
+            )
+            fig = plotJointTrajectory(
+                traj,
+                scene,
+                group_name=group_name,
+                title="Cartesian Path Joint Trajectory",
+                positions=True,
+                velocities=True,
+            )
+            fig.canvas.draw()
+            fig.canvas.flush_events()
+            status_text.value = "Planning complete. Use Animate once to replay the result."
+            animate_button.disabled = False
+        finally:
+            busy["plan"] = False
+
+    @animate_button.on_click
+    def animate_once(_):
+        if last_traj is None:
+            return
+        for q_group in last_traj:
+            viz.display(scene.toFullJointPositions(group_name, q_group))
+            time.sleep(dt)
+
+    _solve_preview()
+    try:
+        while True:
+            time.sleep(10.0)
+    except KeyboardInterrupt:
+        pass
+
+
 def main(
     model: str = "ur5",
     speed_mode: CartesianSpeedMode = CartesianSpeedMode.TimeOptimal,
@@ -161,6 +397,12 @@ def main(
     path_num_passes: int = 5,
     path_corner_radius: float = 0.0,
     path_corner_arc_step_deg: float = 1.0,
+    ik_max_iters: int = 100,
+    ik_step_size: float = 1.0,
+    ik_max_linear_error_norm: float = 0.001,
+    ik_max_angular_error_norm: float = 0.001,
+    ik_check_collisions: bool = True,
+    interactive_goal: bool = True,
     host: str = "localhost",
     port: str = "8000",
 ):
@@ -193,6 +435,13 @@ def main(
             chords. Coarse values (e.g. 15) facet the arc into a few straight segments whose kinks
             show up as a jagged velocity profile; use a small value (~1-2) so the arc is smooth and
             the tool carries speed cleanly through the corner. Ignored when path_corner_radius=0.
+        ik_max_iters: Maximum iterations for the interactive target IK preview.
+        ik_step_size: Step size for the interactive target IK preview.
+        ik_max_linear_error_norm: Linear error threshold for the preview IK solver.
+        ik_max_angular_error_norm: Angular error threshold for the preview IK solver.
+        ik_check_collisions: Whether the preview IK solver should reject colliding solutions.
+        interactive_goal: If true, expose a draggable Viser target and preview the arm while moving
+            it. If false, run the original non-interactive planning flow.
         host: The host for the ViserVisualizer.
         port: The port for the ViserVisualizer.
     """
@@ -250,6 +499,40 @@ def main(
     )
     planner = CartesianPathPlanner(scene, options)
 
+    model_pin = pin.buildModelFromXML(urdf_xml, mimic=True)
+    collision_model = pin.buildGeomFromUrdfString(
+        model_pin, urdf_xml, pin.GeometryType.COLLISION, package_dirs=package_paths
+    )
+    visual_model = pin.buildGeomFromUrdfString(
+        model_pin, urdf_xml, pin.GeometryType.VISUAL, package_dirs=package_paths
+    )
+    viz = ViserVisualizer(model_pin, collision_model, visual_model)
+    viz.initViewer(open=False, loadModel=True, host=host, port=port)
+    viz.display(q_full)
+
+    if interactive_goal:
+        _run_interactive_cartesian_planning(
+            scene=scene,
+            viz=viz,
+            planner=planner,
+            model_data=model_data,
+            q_home_full=q_full,
+            base_link=base_link,
+            tip_frames=tip_frames,
+            path_size=path_size,
+            path_num_passes=path_num_passes,
+            path_corner_radius=path_corner_radius,
+            path_corner_arc_step_deg=path_corner_arc_step_deg,
+            dt=dt,
+            max_linear_speed=max_linear_speed,
+            ik_max_iters=ik_max_iters,
+            ik_step_size=ik_step_size,
+            ik_max_linear_error_norm=ik_max_linear_error_norm,
+            ik_max_angular_error_norm=ik_max_angular_error_norm,
+            ik_check_collisions=ik_check_collisions,
+        )
+        return
+
     q_start = JointConfiguration()
     q_start.positions = q_full
 
@@ -258,19 +541,19 @@ def main(
         f"Cartesian path for {len(tip_frames)} end-effector(s) "
         f"({', '.join(tip_frames)}) in {speed_mode.name} mode..."
     )
-    t0 = time.time()
+    plan_start = time.perf_counter()
     try:
         result = planner.plan(path, q_start)
     except RuntimeError as e:
         print(f"  Planning failed: {e}")
         sys.exit(1)
-    elapsed = time.time() - t0
+    elapsed = time.perf_counter() - plan_start
 
     traj = result
     peak_velocity_ratio, peak_acceleration_ratio = planner.compute_peak_limit_ratios(
         traj
     )
-    print(f"  Planned in {elapsed * 1e3:.1f} ms")
+    print(f"Plan stats: cartesian {elapsed * 1e3:.1f} ms")
     print(f"  Trajectory samples: {len(traj.times)}")
     print(f"  Trajectory duration: {traj.times[-1]:.3f} s")
     print(
@@ -289,18 +572,6 @@ def main(
         positions=True,
         velocities=True,
     )
-
-    # Visualize: build a redundant Pinocchio model for rendering with mimic joints.
-    model_pin = pin.buildModelFromXML(urdf_xml, mimic=True)
-    collision_model = pin.buildGeomFromUrdfString(
-        model_pin, urdf_xml, pin.GeometryType.COLLISION, package_dirs=package_paths
-    )
-    visual_model = pin.buildGeomFromUrdfString(
-        model_pin, urdf_xml, pin.GeometryType.VISUAL, package_dirs=package_paths
-    )
-    viz = ViserVisualizer(model_pin, collision_model, visual_model)
-    viz.initViewer(open=True, loadModel=True, host=host, port=port)
-    viz.display(q_full)
 
     # Draw the reference path (commanded waypoints, green) vs. the actual traced
     # path (forward kinematics of the planned trajectory, red), once per end-effector.
