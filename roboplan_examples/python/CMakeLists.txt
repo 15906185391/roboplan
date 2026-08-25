@@ -12,6 +12,7 @@ install(
   example_toppra_joint_planning.py
   example_scene.py
   example_teleop.py
+  preview_visualization.py
   roboplan_gui.py
   DESTINATION lib/roboplan_examples
 )

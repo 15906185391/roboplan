@@ -10,9 +10,9 @@ import numpy as np
 import pinocchio as pin
 import tyro
 import xacro
-from pinocchio.visualize import ViserVisualizer
 
 from common import get_home_configuration, get_model_data
+from preview_visualization import make_static_and_preview_visualizers
 from roboplan.core import JointPath, Scene, collapseContinuousJointPositions
 from roboplan.example_models import get_package_share_dir
 from roboplan.toppra import PathParameterizerTOPPRA, SplineFittingMode, TOPPRAOptions
@@ -265,9 +265,15 @@ def main(
         model, urdf_xml, pin.GeometryType.VISUAL, package_dirs=package_paths
     )
 
-    viz = ViserVisualizer(model, collision_model, visual_model)
-    viz.initViewer(open=False, loadModel=True, host=host, port=port)
-    viz.display(q_home_full)
+    fixed_viz, preview_viz = make_static_and_preview_visualizers(
+        model,
+        collision_model,
+        visual_model,
+        host,
+        port,
+    )
+    fixed_viz.display(q_home_full)
+    preview_viz.display(q_home_full)
     time.sleep(0.1)
 
     if interactive_goal:
@@ -276,15 +282,12 @@ def main(
             scene, group_name, q_home_full[np.asarray(group_info.q_indices)]
         )
         preview_guard = {"busy": False}
-        preview_solution = JointPath()
-        preview_solution.joint_names = list(group_info.joint_names)
-
-        status_text = viz.viewer.gui.add_text(
+        status_text = fixed_viz.viewer.gui.add_text(
             "Status",
             "Adjust the joint sliders, then plan the path.",
             disabled=True,
         )
-        plan_stats = viz.viewer.gui.add_text(
+        plan_stats = fixed_viz.viewer.gui.add_text(
             "Plan stats",
             "Waiting for the first plan.",
             disabled=True,
@@ -300,7 +303,7 @@ def main(
             if not np.isfinite(hi):
                 hi = np.pi
             initial = float(np.clip(q_goal[idx], lo, hi))
-            slider = viz.viewer.gui.add_slider(
+            slider = fixed_viz.viewer.gui.add_slider(
                 f"{joint_name}",
                 min=lo,
                 max=hi,
@@ -318,15 +321,15 @@ def main(
             q_group = current_goal_group()
             q_full = scene.toFullJointPositions(group_name, q_group)
             scene.setJointPositions(q_full)
-            viz.display(q_full)
-            status_text.value = "目标已更新，机器人已预览。"
+            preview_viz.display(q_full)
+            status_text.value = "目标已更新，透明预览机器人已更新。"
 
         for slider in sliders:
             slider.on_update(preview_goal)
 
-        reset_button = viz.viewer.gui.add_button("Reset Goal")
-        plan_button = viz.viewer.gui.add_button("Plan trajectory")
-        animate_button = viz.viewer.gui.add_button("Animate once")
+        reset_button = fixed_viz.viewer.gui.add_button("Reset Goal")
+        plan_button = fixed_viz.viewer.gui.add_button("Plan trajectory")
+        animate_button = fixed_viz.viewer.gui.add_button("Animate once")
         animate_button.disabled = True
         last_traj: list[np.ndarray] | None = None
 
@@ -346,8 +349,10 @@ def main(
             nonlocal last_traj
             preview_guard["busy"] = True
             try:
-                preview_goal()
                 q_goal_group = current_goal_group()
+                q_goal_full = scene.toFullJointPositions(group_name, q_goal_group)
+                scene.setJointPositions(q_goal_full)
+                preview_viz.display(q_goal_full)
                 path, _ = _make_goal_joint_waypoints(
                     scene,
                     group_name,
@@ -382,9 +387,9 @@ def main(
                 print(f"Plan stats: toppra {plan_elapsed * 1e3:.1f} ms")
                 print(f"Trajectory duration: {traj.times[-1]:.3f} s")
 
-                viz.display(q_home_full)
+                fixed_viz.display(q_home_full)
                 visualizeJointTrajectory(
-                    viz,
+                    fixed_viz,
                     scene,
                     traj,
                     model_data.ee_names,
@@ -410,7 +415,7 @@ def main(
                 animate_button.disabled = preview_only
                 if not preview_only:
                     for q_group in traj.positions:
-                        viz.display(scene.toFullJointPositions(group_name, q_group))
+                        preview_viz.display(scene.toFullJointPositions(group_name, q_group))
                         time.sleep(dt)
             finally:
                 preview_guard["busy"] = False
@@ -420,7 +425,7 @@ def main(
             if last_traj is None:
                 return
             for q_group in last_traj:
-                viz.display(scene.toFullJointPositions(group_name, q_group))
+                preview_viz.display(scene.toFullJointPositions(group_name, q_group))
                 time.sleep(dt)
 
         preview_goal()
@@ -472,7 +477,7 @@ def main(
         print("Safety check: collision detected in sampled path or timed trajectory.")
 
     visualizeJointTrajectory(
-        viz,
+        fixed_viz,
         scene,
         traj,
         model_data.ee_names,
@@ -512,19 +517,19 @@ def main(
         target_step_idx = max(0, min(target_step_idx, len(trajectory_positions) - 1))
         q_full = scene.toFullJointPositions(group_name, trajectory_positions[target_step_idx])
         scene.setJointPositions(q_full)
-        viz.display(q_full)
+        preview_viz.display(q_full)
         if update_slider:
             step_slider.value = target_step_idx
 
-    status_text = viz.viewer.gui.add_text(
+    status_text = fixed_viz.viewer.gui.add_text(
         "Status",
         "Ready to preview." if safety_ok else "Collision detected; execution disabled.",
         disabled=True,
     )
-    preview_button = viz.viewer.gui.add_button("Preview trajectory")
-    execute_button = viz.viewer.gui.add_button("Execute trajectory")
-    reset_button = viz.viewer.gui.add_button("Reset")
-    step_slider = viz.viewer.gui.add_slider(
+    preview_button = fixed_viz.viewer.gui.add_button("Preview trajectory")
+    execute_button = fixed_viz.viewer.gui.add_button("Execute trajectory")
+    reset_button = fixed_viz.viewer.gui.add_button("Reset")
+    step_slider = fixed_viz.viewer.gui.add_slider(
         "Trajectory step",
         min=0,
         max=len(trajectory_positions) - 1,

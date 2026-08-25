@@ -15,6 +15,7 @@ import pinocchio as pin
 from pinocchio.visualize import ViserVisualizer
 
 from common import ObstacleConfig, get_model_data
+from preview_visualization import make_static_and_preview_visualizers
 
 try:
     import coal
@@ -269,6 +270,9 @@ def main(
     collision_model = pin.buildGeomFromUrdfString(
         pin_model, urdf_xml, pin.GeometryType.COLLISION, package_dirs=package_paths
     )
+    preview_collision_model = pin.buildGeomFromUrdfString(
+        pin_model, urdf_xml, pin.GeometryType.COLLISION, package_dirs=package_paths
+    )
     visual_model = pin.buildGeomFromUrdfString(
         pin_model, urdf_xml, pin.GeometryType.VISUAL, package_dirs=package_paths
     )
@@ -286,12 +290,18 @@ def main(
         obstacle.addToScene(scene)
         obstacle.addToPinocchioModels(pin_model, collision_model, visual_model)
 
-    viz = ViserVisualizer(pin_model, collision_model, visual_model)
-    viz.initViewer(open=False, loadModel=True, host=host, port=port)
+    fixed_viz, preview_viz = make_static_and_preview_visualizers(
+        pin_model,
+        collision_model,
+        visual_model,
+        host,
+        port,
+        preview_collision_model=preview_collision_model,
+    )
 
     def add_marker(name, q, color):
         """Marks an end effector position with a small sphere."""
-        viz.viewer.scene.add_icosphere(
+        fixed_viz.viewer.scene.add_icosphere(
             name,
             radius=0.025,
             color=color,
@@ -299,7 +309,7 @@ def main(
         )
 
     # Draw the safe zone, translucent so the robot stays visible inside it.
-    viz.viewer.scene.add_box(
+    fixed_viz.viewer.scene.add_box(
         "/safe_zone_wireframe",
         dimensions=tuple(zone_size),
         position=0.5 * (ZONE_MIN + ZONE_MAX),
@@ -392,7 +402,8 @@ def main(
     traj_dt = 0.01
 
     add_marker("/constrained_rrt/start", q_start, (0, 200, 0))
-    viz.display(q_start)
+    fixed_viz.display(q_start)
+    preview_viz.display(q_start)
     scene.setJointPositions(q_start)
 
     if interactive_goal:
@@ -409,7 +420,7 @@ def main(
         goal_target = CartesianConfiguration()
         goal_target.base_frame = model_data.base_link
         goal_target.tip_frame = ee_name
-        goal_control = viz.viewer.scene.add_transform_controls(
+        goal_control = fixed_viz.viewer.scene.add_transform_controls(
             "/constrained_rrt/goal",
             depth_test=False,
             scale=0.2,
@@ -419,9 +430,10 @@ def main(
         goal_pose = scene.forwardKinematics(q_goal_full, ee_name)
         goal_control.position = goal_pose[:3, 3].copy()
         goal_control.wxyz = pin.Quaternion(goal_pose[:3, :3]).coeffs()[[3, 0, 1, 2]]
+        preview_viz.display(q_goal_full)
 
         solve_times = deque(maxlen=30)
-        solve_stats = viz.viewer.gui.add_text(
+        solve_stats = fixed_viz.viewer.gui.add_text(
             "Solve stats",
             "Waiting for plan-time IK.",
             disabled=True,
@@ -430,7 +442,7 @@ def main(
         metrics_queue = queue.Queue()
         cur_traj = None
         animate = False
-        status_text = viz.viewer.gui.add_text(
+        status_text = fixed_viz.viewer.gui.add_text(
             "Status",
             "Drag the goal marker, then plan the path. IK runs only when planning starts.",
             disabled=True,
@@ -486,6 +498,7 @@ def main(
                     q_candidate = projected
 
                 q_goal_full = q_candidate.copy()
+                preview_viz.display(q_goal_full)
                 q_goal_solution.positions = q_goal_full[q_indices].copy()
                 q_goal_seed.positions = q_goal_solution.positions
                 _sync_goal_control(q_goal_full)
@@ -494,14 +507,14 @@ def main(
             finally:
                 preview_state["busy"] = False
 
-        plan_stats = viz.viewer.gui.add_text(
+        plan_stats = fixed_viz.viewer.gui.add_text(
             "Plan stats",
             "Waiting for the first plan.",
             disabled=True,
         )
-        plan_button = viz.viewer.gui.add_button("Plan path")
-        reset_button = viz.viewer.gui.add_button("Reset goal")
-        animate_button = viz.viewer.gui.add_button("Animate trajectory")
+        plan_button = fixed_viz.viewer.gui.add_button("Plan path")
+        reset_button = fixed_viz.viewer.gui.add_button("Reset goal")
+        animate_button = fixed_viz.viewer.gui.add_button("Animate trajectory")
         animate_button.disabled = True
 
         @reset_button.on_click
@@ -512,7 +525,7 @@ def main(
             goal_control.position = goal_pose[:3, 3].copy()
             goal_control.wxyz = pin.Quaternion(goal_pose[:3, :3]).coeffs()[[3, 0, 1, 2]]
             scene.setJointPositions(q_start)
-            viz.display(q_start)
+            preview_viz.display(q_goal_full)
             status_text.value = "Goal reset to the initial sampled pose."
 
         @plan_button.on_click
@@ -562,7 +575,7 @@ def main(
                         "unconstrained", baseline_metrics, tilt_limit, position_slack
                     )
                     addPositionPolyline(
-                        viz,
+                        fixed_viz,
                         "/constrained_rrt/unconstrained_path",
                         baseline_metrics["positions"],
                         (200, 60, 60),
@@ -576,9 +589,9 @@ def main(
                     path, TOPPRAOptions(dt=traj_dt, mode=SplineFittingMode.Adaptive)
                 )
                 toppra_elapsed = time.perf_counter() - toppra_start
-                viz.display(q_start)
+                fixed_viz.display(q_start)
                 visualizeJointTrajectory(
-                    viz, scene, traj, [ee_name], (0, 180, 0), "/constrained_rrt/path"
+                    fixed_viz, scene, traj, [ee_name], (0, 180, 0), "/constrained_rrt/path"
                 )
 
                 total_elapsed = time.perf_counter() - plan_start
@@ -623,10 +636,10 @@ def main(
             elif animate and cur_traj is not None:
                 print("\nAnimating trajectory...")
                 for q in cur_traj.positions:
-                    viz.display(scene.toFullJointPositions(group_name, q))
+                    preview_viz.display(scene.toFullJointPositions(group_name, q))
                     time.sleep(traj_dt)
                     _pump_matplotlib()
-                viz.display(q_start)
+                preview_viz.display(q_start)
                 animate = False
                 plan_button.disabled = False
                 animate_button.disabled = False
@@ -642,14 +655,14 @@ def main(
     metrics_queue = queue.Queue()
     cur_traj = None
     animate = False
-    plan_stats = viz.viewer.gui.add_text(
+    plan_stats = fixed_viz.viewer.gui.add_text(
         "Plan stats",
         "Waiting for the first plan.",
         disabled=True,
     )
 
-    plan_button = viz.viewer.gui.add_button("Plan path")
-    animate_button = viz.viewer.gui.add_button("Animate trajectory")
+    plan_button = fixed_viz.viewer.gui.add_button("Plan path")
+    animate_button = fixed_viz.viewer.gui.add_button("Animate trajectory")
     animate_button.disabled = True
 
     @plan_button.on_click
@@ -706,7 +719,7 @@ def main(
                     "unconstrained", baseline_metrics, tilt_limit, position_slack
                 )
                 addPositionPolyline(
-                    viz,
+                    fixed_viz,
                     "/constrained_rrt/unconstrained_path",
                     baseline_metrics["positions"],
                     (200, 60, 60),
@@ -720,9 +733,9 @@ def main(
                 path, TOPPRAOptions(dt=traj_dt, mode=SplineFittingMode.Adaptive)
             )
             toppra_elapsed = time.perf_counter() - toppra_start
-            viz.display(q_start)
+            fixed_viz.display(q_start)
             visualizeJointTrajectory(
-                viz, scene, traj, [ee_name], (0, 180, 0), "/constrained_rrt/path"
+                fixed_viz, scene, traj, [ee_name], (0, 180, 0), "/constrained_rrt/path"
             )
 
             total_elapsed = time.perf_counter() - plan_start
@@ -764,10 +777,10 @@ def main(
         elif animate and cur_traj is not None:
             print("\nAnimating trajectory...")
             for q in cur_traj.positions:
-                viz.display(scene.toFullJointPositions(group_name, q))
+                preview_viz.display(scene.toFullJointPositions(group_name, q))
                 time.sleep(traj_dt)
                 _pump_matplotlib()
-            viz.display(q_start)
+            preview_viz.display(q_start)
             animate = False
             plan_button.disabled = False
             animate_button.disabled = False

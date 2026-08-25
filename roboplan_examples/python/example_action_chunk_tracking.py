@@ -35,6 +35,7 @@ import xacro
 from pinocchio.visualize import ViserVisualizer
 
 from common import get_home_configuration, get_model_data
+from preview_visualization import make_static_and_preview_visualizers
 from roboplan.core import (
     CartesianConfiguration,
     CartesianTrajectory,
@@ -361,9 +362,15 @@ def main(
         package_dirs=package_paths,
     )
 
-    viz = ViserVisualizer(model_pin, collision_model, visual_model)
-    viz.initViewer(open=False, loadModel=True, host=host, port=port)
-    viz.display(q_start)
+    fixed_viz, preview_viz = make_static_and_preview_visualizers(
+        model_pin,
+        collision_model,
+        visual_model,
+        host,
+        port,
+    )
+    fixed_viz.display(q_start)
+    preview_viz.display(q_start)
 
     scene.setJointPositions(q_start)
 
@@ -553,7 +560,7 @@ def main(
             trajectory.append(q_current.copy())
 
             if sleep:
-                viz.display(q_current)
+                preview_viz.display(q_current)
                 elapsed = time.time() - loop_start
                 time.sleep(max(0.0, dt - elapsed))
 
@@ -591,7 +598,7 @@ def main(
             trajectory.append(q_current.copy())
 
             if sleep:
-                viz.display(q_current)
+                preview_viz.display(q_current)
                 elapsed = time.time() - loop_start
                 time.sleep(max(0.0, dt - elapsed))
 
@@ -620,7 +627,7 @@ def main(
         # 2. dense interpolated references,
         # 3. final executed trajectory
         visualize_ee_traces(
-            viz,
+            fixed_viz,
             ee_frame_name,
             sparse_target_positions_by_frame[ee_frame_name],
             dense_target_positions_by_frame[ee_frame_name],
@@ -628,7 +635,7 @@ def main(
             executed_color,
         )
 
-        current_ee_markers[ee_frame_name] = viz.viewer.scene.add_icosphere(
+        current_ee_markers[ee_frame_name] = fixed_viz.viewer.scene.add_icosphere(
             f"/action_chunk/{ee_frame_name}/current_ee",
             radius=0.022,
             position=executed_ee_positions_by_frame[ee_frame_name][0],
@@ -647,9 +654,9 @@ def main(
 
     animating = False
 
-    animate_button = viz.viewer.gui.add_button("Animate action chunk")
-    reset_button = viz.viewer.gui.add_button("Reset")
-    step_slider = viz.viewer.gui.add_slider(
+    animate_button = fixed_viz.viewer.gui.add_button("Animate action chunk")
+    reset_button = fixed_viz.viewer.gui.add_button("Reset")
+    step_slider = fixed_viz.viewer.gui.add_slider(
         "Trajectory step",
         min=0,
         max=len(trajectory) - 1,
@@ -660,7 +667,7 @@ def main(
     def display_step(target_step_idx: int, update_slider: bool = True):
         """Display one tracked configuration by index."""
         target_step_idx = max(0, min(target_step_idx, len(trajectory) - 1))
-        viz.display(trajectory[target_step_idx])
+        preview_viz.display(trajectory[target_step_idx])
         for ee_frame_name, marker in current_ee_markers.items():
             marker.position = executed_ee_positions_by_frame[ee_frame_name][
                 target_step_idx

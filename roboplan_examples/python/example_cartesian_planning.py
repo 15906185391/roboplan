@@ -12,6 +12,7 @@ import pinocchio as pin
 from pinocchio.visualize import ViserVisualizer
 
 from common import get_home_configuration, get_model_data
+from preview_visualization import make_static_and_preview_visualizers
 from roboplan.core import CartesianConfiguration, CartesianPath, JointConfiguration, Scene
 from roboplan.example_models import get_package_share_dir
 from roboplan.cartesian_planning import (
@@ -149,7 +150,8 @@ def make_lawnmower_path(
 
 def _run_interactive_cartesian_planning(
     scene: Scene,
-    viz: ViserVisualizer,
+    fixed_viz: ViserVisualizer,
+    preview_viz: ViserVisualizer,
     planner: CartesianPathPlanner,
     model_data,
     q_home_full: np.ndarray,
@@ -196,7 +198,7 @@ def _run_interactive_cartesian_planning(
         goals.append(goal)
 
         start_pose = scene.forwardKinematics(q_home_full, ee_name)
-        controls = viz.viewer.scene.add_transform_controls(
+        controls = fixed_viz.viewer.scene.add_transform_controls(
             f"/cartesian_goal/{ee_name}",
             depth_test=False,
             scale=0.2,
@@ -211,17 +213,17 @@ def _run_interactive_cartesian_planning(
     last_traj: list[np.ndarray] | None = None
     busy = {"preview": False, "plan": False}
 
-    status_text = viz.viewer.gui.add_text(
+    status_text = fixed_viz.viewer.gui.add_text(
         "Status",
         "Drag the target frame, then plan the path.",
         disabled=True,
     )
-    solve_stats = viz.viewer.gui.add_text(
+    solve_stats = fixed_viz.viewer.gui.add_text(
         "Solve stats",
         "Waiting for plan-time IK.",
         disabled=True,
     )
-    plan_stats = viz.viewer.gui.add_text(
+    plan_stats = fixed_viz.viewer.gui.add_text(
         "Plan stats",
         "Waiting for the first plan.",
         disabled=True,
@@ -265,16 +267,16 @@ def _run_interactive_cartesian_planning(
 
             q_preview = scene.toFullJointPositions(group_name, solution.positions)
             scene.setJointPositions(q_preview)
-            viz.display(q_preview)
+            preview_viz.display(q_preview)
             q_seed.positions = solution.positions
             status_text.value = "Target solved; planning can continue."
             return True
         finally:
             busy["preview"] = False
 
-    reset_button = viz.viewer.gui.add_button("Reset target")
-    plan_button = viz.viewer.gui.add_button("Plan trajectory")
-    animate_button = viz.viewer.gui.add_button("Animate once")
+    reset_button = fixed_viz.viewer.gui.add_button("Reset target")
+    plan_button = fixed_viz.viewer.gui.add_button("Plan trajectory")
+    animate_button = fixed_viz.viewer.gui.add_button("Animate once")
     animate_button.disabled = True
 
     @reset_button.on_click
@@ -284,7 +286,7 @@ def _run_interactive_cartesian_planning(
             controls.position = start_pose[:3, 3]
             controls.wxyz = pin.Quaternion(start_pose[:3, :3]).coeffs()[[3, 0, 1, 2]]
         scene.setJointPositions(q_home_full)
-        viz.display(q_home_full)
+        preview_viz.display(q_home_full)
         status_text.value = "Target reset to the home pose. Drag it or plan directly."
 
     @plan_button.on_click
@@ -341,7 +343,7 @@ def _run_interactive_cartesian_planning(
             print(f"  Peak acceleration / limit: {peak_acceleration_ratio:.2f}")
 
             visualizeJointTrajectory(
-                viz,
+                fixed_viz,
                 scene,
                 traj,
                 tip_frames,
@@ -368,7 +370,7 @@ def _run_interactive_cartesian_planning(
         if last_traj is None:
             return
         for q_group in last_traj:
-            viz.display(scene.toFullJointPositions(group_name, q_group))
+            preview_viz.display(scene.toFullJointPositions(group_name, q_group))
             time.sleep(dt)
 
     status_text.value = "Ready. Drag the target frame; IK runs when planning starts."
@@ -504,14 +506,21 @@ def main(
     visual_model = pin.buildGeomFromUrdfString(
         model_pin, urdf_xml, pin.GeometryType.VISUAL, package_dirs=package_paths
     )
-    viz = ViserVisualizer(model_pin, collision_model, visual_model)
-    viz.initViewer(open=False, loadModel=True, host=host, port=port)
-    viz.display(q_full)
+    fixed_viz, preview_viz = make_static_and_preview_visualizers(
+        model_pin,
+        collision_model,
+        visual_model,
+        host,
+        port,
+    )
+    fixed_viz.display(q_full)
+    preview_viz.display(q_full)
 
     if interactive_goal:
         _run_interactive_cartesian_planning(
             scene=scene,
-            viz=viz,
+            fixed_viz=fixed_viz,
+            preview_viz=preview_viz,
             planner=planner,
             model_data=model_data,
             q_home_full=q_full,
@@ -583,7 +592,7 @@ def main(
             [(world_T_base @ waypoint)[:3, 3] for waypoint in path.tforms[i]]
         )
         visualizePositionTrace(
-            viz,
+            fixed_viz,
             reference_positions,
             trace_name=f"/reference_path/{tip_frame}",
             waypoint_root=f"/reference_waypoints/{tip_frame}",
@@ -593,7 +602,7 @@ def main(
             waypoint_radius=0.0025,
         )
     visualizeJointTrajectory(
-        viz,
+        fixed_viz,
         scene,
         traj,
         tip_frames,
@@ -614,7 +623,7 @@ def main(
                 q_play = scene.toFullJointPositions(
                     model_data.default_joint_group, group_positions
                 )
-                viz.display(q_play)
+                preview_viz.display(q_play)
                 fig.canvas.flush_events()
                 time.sleep(max(0.0, dt - (time.perf_counter() - t_start)))
                 _pump_matplotlib()

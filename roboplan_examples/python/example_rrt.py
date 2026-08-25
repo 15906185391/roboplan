@@ -13,6 +13,7 @@ import pinocchio as pin
 from pinocchio.visualize import ViserVisualizer
 
 from common import get_model_data, get_octree
+from preview_visualization import make_static_and_preview_visualizers
 from roboplan.core import (
     CartesianConfiguration,
     JointConfiguration,
@@ -113,6 +114,9 @@ def main(
     collision_model = pin.buildGeomFromUrdfString(
         model, urdf_xml, pin.GeometryType.COLLISION, package_dirs=package_paths
     )
+    preview_collision_model = pin.buildGeomFromUrdfString(
+        model, urdf_xml, pin.GeometryType.COLLISION, package_dirs=package_paths
+    )
     visual_model = pin.buildGeomFromUrdfString(
         model, urdf_xml, pin.GeometryType.VISUAL, package_dirs=package_paths
     )
@@ -125,15 +129,21 @@ def main(
             obstacle.addToScene(scene)
             obstacle.addToPinocchioModels(model, collision_model, visual_model)
 
-    viz = ViserVisualizer(model, collision_model, visual_model)
-    viz.initViewer(open=False, loadModel=True, host=host, port=port)
+    fixed_viz, preview_viz = make_static_and_preview_visualizers(
+        model,
+        collision_model,
+        visual_model,
+        host,
+        port,
+        preview_collision_model=preview_collision_model,
+    )
 
     if include_octrees:
         obstacle = get_octree()
         obstacle.addToScene(scene)
         geom_obj = obstacle.createGeometryObject(model)
-        visualizeOcTree(viz, geom_obj, viz.collisionRootNodeName)
-        visualizeOcTree(viz, geom_obj, viz.visualRootNodeName)
+        visualizeOcTree(fixed_viz, geom_obj, fixed_viz.collisionRootNodeName)
+        visualizeOcTree(fixed_viz, geom_obj, fixed_viz.visualRootNodeName)
 
     # Set up an RRT and perform path planning.
     options = RRTOptions(
@@ -165,7 +175,7 @@ def main(
     traj_queue = queue.Queue()
     cur_traj = None
     animate = False
-    plan_stats = viz.viewer.gui.add_text(
+    plan_stats = fixed_viz.viewer.gui.add_text(
         "Plan stats",
         "Waiting for the first plan.",
         disabled=True,
@@ -176,7 +186,8 @@ def main(
 
     q_full = scene.randomCollisionFreePositions()
     scene.setJointPositions(q_full)
-    viz.display(q_full)
+    fixed_viz.display(q_full)
+    preview_viz.display(q_full)
     time.sleep(0.1)
 
     if interactive_goal:
@@ -205,7 +216,7 @@ def main(
             goal_targets.append(target)
 
             pose = scene.forwardKinematics(q_goal_full, ee_name)
-            controls = viz.viewer.scene.add_transform_controls(
+            controls = fixed_viz.viewer.scene.add_transform_controls(
                 f"/rrt/goal/{ee_name}",
                 depth_test=False,
                 scale=0.2,
@@ -216,8 +227,10 @@ def main(
             controls.wxyz = pin.Quaternion(pose[:3, :3]).coeffs()[[3, 0, 1, 2]]
             goal_controls.append(controls)
 
+        preview_viz.display(q_goal_full)
+
         solve_times = deque(maxlen=30)
-        solve_stats = viz.viewer.gui.add_text(
+        solve_stats = fixed_viz.viewer.gui.add_text(
             "Solve stats",
             "Waiting for plan-time IK.",
             disabled=True,
@@ -258,19 +271,20 @@ def main(
                 q_goal_full = scene.toFullJointPositions(
                     model_data.default_joint_group, q_goal_solution.positions
                 )
+                preview_viz.display(q_goal_full)
                 q_goal_seed.positions = q_goal_solution.positions
                 return True
             finally:
                 preview_state["busy"] = False
 
-        status_text = viz.viewer.gui.add_text(
+        status_text = fixed_viz.viewer.gui.add_text(
             "Status",
             "Drag the goal markers, then plan the path. IK runs only when planning starts.",
             disabled=True,
         )
-        plan_button = viz.viewer.gui.add_button("Plan path")
-        reset_button = viz.viewer.gui.add_button("Reset goal")
-        animate_button = viz.viewer.gui.add_button("Animate trajectory")
+        plan_button = fixed_viz.viewer.gui.add_button("Plan path")
+        reset_button = fixed_viz.viewer.gui.add_button("Reset goal")
+        animate_button = fixed_viz.viewer.gui.add_button("Animate trajectory")
         animate_button.disabled = True
 
         @reset_button.on_click
@@ -282,7 +296,7 @@ def main(
                 controls.position = pose[:3, 3].copy()
                 controls.wxyz = pin.Quaternion(pose[:3, :3]).coeffs()[[3, 0, 1, 2]]
             scene.setJointPositions(q_full)
-            viz.display(q_full)
+            preview_viz.display(q_goal_full)
             status_text.value = "Goal reset to the initial sampled pose."
 
         @plan_button.on_click
@@ -339,8 +353,8 @@ def main(
             plan_stats.value = stats
             print(f"Plan stats: {stats}")
 
-            viz.display(q_full)
-            visualizeTree(viz, scene, rrt, model_data.ee_names, 0.05)
+            fixed_viz.display(q_full)
+            visualizeTree(fixed_viz, scene, rrt, model_data.ee_names, 0.05)
 
             q_start_full = scene.toFullJointPositions(
                 model_data.default_joint_group, start.positions
@@ -349,13 +363,13 @@ def main(
                 model_data.default_joint_group, goal.positions
             )
             for ee_name in model_data.ee_names:
-                viz.viewer.scene.add_icosphere(
+                fixed_viz.viewer.scene.add_icosphere(
                     f"/rrt/start/{ee_name}",
                     radius=0.03,
                     color=(0, 200, 0),
                     position=scene.forwardKinematics(q_start_full, ee_name)[:3, 3],
                 )
-                viz.viewer.scene.add_icosphere(
+                fixed_viz.viewer.scene.add_icosphere(
                     f"/rrt/goal/{ee_name}",
                     radius=0.03,
                     color=(200, 0, 0),
@@ -364,10 +378,10 @@ def main(
 
             if include_shortcutting:
                 visualizePath(
-                    viz, scene, path, model_data.ee_names, 0.05, (100, 0, 0), "/rrt/path"
+                    fixed_viz, scene, path, model_data.ee_names, 0.05, (100, 0, 0), "/rrt/path"
                 )
                 visualizeJointTrajectory(
-                    viz,
+                    fixed_viz,
                     scene,
                     traj,
                     model_data.ee_names,
@@ -376,7 +390,7 @@ def main(
                 )
             else:
                 visualizeJointTrajectory(
-                    viz, scene, traj, model_data.ee_names, (100, 0, 0), "/rrt/path"
+                    fixed_viz, scene, traj, model_data.ee_names, (100, 0, 0), "/rrt/path"
                 )
 
             traj_queue.put(traj)
@@ -410,7 +424,7 @@ def main(
                 print("Animating trajectory...")
                 for q in cur_traj.positions:
                     q_full = scene.toFullJointPositions(model_data.default_joint_group, q)
-                    viz.display(q_full)
+                    preview_viz.display(q_full)
                     time.sleep(traj_dt)
                     _pump_matplotlib()
                 animate = False
@@ -423,7 +437,7 @@ def main(
         return
 
     # Create a path planning button.
-    plan_button = viz.viewer.gui.add_button("Plan path")
+    plan_button = fixed_viz.viewer.gui.add_button("Plan path")
 
     @plan_button.on_click
     def plan_path(_):
@@ -476,8 +490,8 @@ def main(
         print(f"Plan stats: {stats}")
 
         # Visualize the tree and path
-        viz.display(q_full)
-        visualizeTree(viz, scene, rrt, model_data.ee_names, 0.05)
+        fixed_viz.display(q_full)
+        visualizeTree(fixed_viz, scene, rrt, model_data.ee_names, 0.05)
 
         # Show the start (green) and goal (red) end-effector positions.
         q_start_full = scene.toFullJointPositions(
@@ -487,13 +501,13 @@ def main(
             model_data.default_joint_group, goal.positions
         )
         for ee_name in model_data.ee_names:
-            viz.viewer.scene.add_icosphere(
+            fixed_viz.viewer.scene.add_icosphere(
                 f"/rrt/start/{ee_name}",
                 radius=0.03,
                 color=(0, 200, 0),
                 position=scene.forwardKinematics(q_start_full, ee_name)[:3, 3],
             )
-            viz.viewer.scene.add_icosphere(
+            fixed_viz.viewer.scene.add_icosphere(
                 f"/rrt/goal/{ee_name}",
                 radius=0.03,
                 color=(200, 0, 0),
@@ -502,10 +516,10 @@ def main(
 
         if include_shortcutting:
             visualizePath(
-                viz, scene, path, model_data.ee_names, 0.05, (100, 0, 0), "/rrt/path"
+                fixed_viz, scene, path, model_data.ee_names, 0.05, (100, 0, 0), "/rrt/path"
             )
             visualizeJointTrajectory(
-                viz,
+                fixed_viz,
                 scene,
                 traj,
                 model_data.ee_names,
@@ -514,7 +528,7 @@ def main(
             )
         else:
             visualizeJointTrajectory(
-                viz, scene, traj, model_data.ee_names, (100, 0, 0), "/rrt/path"
+                fixed_viz, scene, traj, model_data.ee_names, (100, 0, 0), "/rrt/path"
             )
 
         traj_queue.put(traj)
@@ -522,7 +536,7 @@ def main(
         animate_button.disabled = False
 
     # Create a trajectory animation button.
-    animate_button = viz.viewer.gui.add_button("Animate trajectory")
+    animate_button = fixed_viz.viewer.gui.add_button("Animate trajectory")
     animate_button.disabled = True
 
     @animate_button.on_click
@@ -552,7 +566,7 @@ def main(
             print("Animating trajectory...")
             for q in cur_traj.positions:
                 q_full = scene.toFullJointPositions(model_data.default_joint_group, q)
-                viz.display(q_full)
+                preview_viz.display(q_full)
                 time.sleep(traj_dt)
                 _pump_matplotlib()
             animate = False
