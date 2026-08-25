@@ -12,7 +12,12 @@ import numpy as np
 import pinocchio as pin
 from pinocchio.visualize import ViserVisualizer
 
-from common import get_model_data, get_octree
+from common import (
+    get_home_configuration,
+    get_model_data,
+    get_octree,
+    load_octree_from_ros2_point_cloud,
+)
 from preview_visualization import make_static_and_preview_visualizers
 from roboplan.core import (
     CartesianConfiguration,
@@ -34,7 +39,30 @@ from roboplan.visualization import (
 
 
 def _pump_matplotlib(delay: float = 0.001) -> None:
-    plt.pause(delay)
+    try:
+        plt.pause(delay)
+    except RuntimeError as exc:
+        if "Event loop already running" not in str(exc):
+            raise
+        time.sleep(delay)
+
+
+def _sample_collision_free_full_configuration(
+    scene: Scene,
+    model_data,
+    tries: int = 32,
+) -> np.ndarray:
+    """Return a full collision-free configuration, falling back to the home pose."""
+    q_home = get_home_configuration(scene, model_data)
+    if not scene.hasCollisions(q_home):
+        return q_home
+
+    for _ in range(tries):
+        q_full = scene.randomCollisionFreePositions()
+        if q_full is not None:
+            return q_full
+
+    raise RuntimeError("Could not sample a collision-free initial configuration.")
 
 
 def main(
@@ -57,6 +85,12 @@ def main(
     rng_seed: int | None = None,
     include_obstacles: bool = False,
     include_octrees: bool = False,
+    octree_pointcloud_topic: str = "/camera/depth/points",
+    octree_voxel_resolution: float = 0.04,
+    octree_timeout_s: float = 5.0,
+    octree_max_points: int = 100000,
+    octree_target_frame: str = "universe",
+    octree_use_tf: bool = False,
     interactive_goal: bool = True,
 ):
     """
@@ -82,7 +116,14 @@ def main(
         port: The port for the ViserVisualizer.
         rng_seed: The seed for selecting random start and end poses and solving RRT.
         include_obstacles: Whether or not to include additional obstacles in the scene. Don't use with `include_octrees` argument
-        include_octrees: Whether or not to include additional octrees in the scene. Don't use with `include_obstacles` argument
+        include_octrees: Whether or not to include an octree obstacle converted from a ROS 2 PointCloud2 topic.
+        octree_pointcloud_topic: ROS 2 PointCloud2 topic used to build the octree obstacle.
+        octree_voxel_resolution: Voxel resolution used while converting the point cloud to an octree.
+        octree_timeout_s: Seconds to wait for the point cloud and its TF transform before falling back.
+        octree_max_points: Maximum number of downsampled point-cloud points passed to the octree builder.
+        octree_target_frame: Planning frame used for the octree obstacle.
+        octree_use_tf: Whether to transform point cloud data into the planning frame through ROS 2 TF.
+            If false, raw point coordinates are used directly in the planning frame.
         interactive_goal: If true, let the goal end-effector poses be set by dragging Viser
             transform controls and preview the resulting IK solution before planning.
     """
@@ -139,7 +180,33 @@ def main(
     )
 
     if include_octrees:
-        obstacle = get_octree()
+        try:
+            print(
+                f"Loading octree obstacle from ROS 2 point cloud topic "
+                f"{octree_pointcloud_topic}...",
+                flush=True,
+            )
+            obstacle = load_octree_from_ros2_point_cloud(
+                topic_name=octree_pointcloud_topic,
+                voxel_resolution=octree_voxel_resolution,
+                timeout_sec=octree_timeout_s,
+                target_frame=octree_target_frame,
+                max_points=octree_max_points,
+                use_tf=octree_use_tf,
+            )
+            print(
+                f"Loaded octree obstacle from {octree_pointcloud_topic} "
+                f"at {octree_voxel_resolution:.3f} m resolution.",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"Warning: could not build octree from ROS 2 topic "
+                f"{octree_pointcloud_topic}: {exc}",
+                flush=True,
+            )
+            print("Falling back to the bundled example point cloud.", flush=True)
+            obstacle = get_octree()
         obstacle.addToScene(scene)
         geom_obj = obstacle.createGeometryObject(model)
         visualizeOcTree(fixed_viz, geom_obj, fixed_viz.collisionRootNodeName)
@@ -184,7 +251,7 @@ def main(
     if rng_seed:
         rrt.setRngSeed(rng_seed)
 
-    q_full = scene.randomCollisionFreePositions()
+    q_full = _sample_collision_free_full_configuration(scene, model_data)
     scene.setJointPositions(q_full)
     fixed_viz.display(q_full)
     preview_viz.display(q_full)
@@ -202,7 +269,7 @@ def main(
                 check_collisions=True,
             ),
         )
-        q_goal_full = scene.randomCollisionFreePositions()
+        q_goal_full = _sample_collision_free_full_configuration(scene, model_data)
         q_goal_initial_full = q_goal_full.copy()
         q_goal_solution = JointConfiguration()
         q_goal_seed = JointConfiguration()
@@ -296,6 +363,7 @@ def main(
                 controls.position = pose[:3, 3].copy()
                 controls.wxyz = pin.Quaternion(pose[:3, :3]).coeffs()[[3, 0, 1, 2]]
             scene.setJointPositions(q_full)
+            fixed_viz.display(q_full)
             preview_viz.display(q_goal_full)
             status_text.value = "Goal reset to the initial sampled pose."
 
@@ -354,6 +422,7 @@ def main(
             print(f"Plan stats: {stats}")
 
             fixed_viz.display(q_full)
+            preview_viz.display(q_full)
             visualizeTree(fixed_viz, scene, rrt, model_data.ee_names, 0.05)
 
             q_start_full = scene.toFullJointPositions(
@@ -381,17 +450,31 @@ def main(
                     fixed_viz, scene, path, model_data.ee_names, 0.05, (100, 0, 0), "/rrt/path"
                 )
                 visualizeJointTrajectory(
-                    fixed_viz,
+                    preview_viz,
                     scene,
                     traj,
                     model_data.ee_names,
-                    (0, 100, 0),
-                    "/rrt/shortcut_path",
+                    (0, 120, 255),
+                    "/rrt/shortcut_path_preview",
                 )
             else:
                 visualizeJointTrajectory(
-                    fixed_viz, scene, traj, model_data.ee_names, (100, 0, 0), "/rrt/path"
+                    preview_viz,
+                    scene,
+                    traj,
+                    model_data.ee_names,
+                    (0, 120, 255),
+                    "/rrt/path_preview",
                 )
+
+            preview_viz.display(q_full)
+            for q in traj.positions:
+                q_step_full = scene.toFullJointPositions(
+                    model_data.default_joint_group, q
+                )
+                scene.setJointPositions(q_step_full)
+                preview_viz.display(q_step_full)
+                time.sleep(traj_dt)
 
             traj_queue.put(traj)
             status_text.value = "Planning complete. Use Animate trajectory to replay it."
@@ -422,11 +505,16 @@ def main(
                 _pump_matplotlib()
             elif animate and cur_traj is not None:
                 print("Animating trajectory...")
+                fixed_viz.display(q_full)
                 for q in cur_traj.positions:
-                    q_full = scene.toFullJointPositions(model_data.default_joint_group, q)
-                    preview_viz.display(q_full)
+                    q_step_full = scene.toFullJointPositions(
+                        model_data.default_joint_group, q
+                    )
+                    scene.setJointPositions(q_step_full)
+                    fixed_viz.display(q_step_full)
                     time.sleep(traj_dt)
                     _pump_matplotlib()
+                preview_viz.display(q_step_full)
                 animate = False
                 plan_button.disabled = False
                 animate_button.disabled = False
@@ -451,7 +539,9 @@ def main(
         assert start.positions is not None
 
         goal = JointConfiguration()
-        goal.positions = scene.randomCollisionFreePositions()[q_indices]
+        goal.positions = _sample_collision_free_full_configuration(
+            scene, model_data
+        )[q_indices]
         assert goal.positions is not None
 
         print("\nPlanning...")
@@ -519,16 +609,21 @@ def main(
                 fixed_viz, scene, path, model_data.ee_names, 0.05, (100, 0, 0), "/rrt/path"
             )
             visualizeJointTrajectory(
-                fixed_viz,
+                preview_viz,
                 scene,
                 traj,
                 model_data.ee_names,
-                (0, 100, 0),
-                "/rrt/shortcut_path",
+                (0, 120, 255),
+                "/rrt/shortcut_path_preview",
             )
         else:
             visualizeJointTrajectory(
-                fixed_viz, scene, traj, model_data.ee_names, (100, 0, 0), "/rrt/path"
+                preview_viz,
+                scene,
+                traj,
+                model_data.ee_names,
+                (0, 120, 255),
+                "/rrt/path_preview",
             )
 
         traj_queue.put(traj)
@@ -564,11 +659,16 @@ def main(
             _pump_matplotlib()
         elif animate and cur_traj is not None:
             print("Animating trajectory...")
+            fixed_viz.display(q_full)
             for q in cur_traj.positions:
-                q_full = scene.toFullJointPositions(model_data.default_joint_group, q)
-                preview_viz.display(q_full)
+                q_step_full = scene.toFullJointPositions(
+                    model_data.default_joint_group, q
+                )
+                scene.setJointPositions(q_step_full)
+                fixed_viz.display(q_step_full)
                 time.sleep(traj_dt)
                 _pump_matplotlib()
+            preview_viz.display(q_step_full)
             animate = False
             plan_button.disabled = False
             animate_button.disabled = False

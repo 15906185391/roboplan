@@ -525,6 +525,7 @@ def main(
             goal_control.position = goal_pose[:3, 3].copy()
             goal_control.wxyz = pin.Quaternion(goal_pose[:3, :3]).coeffs()[[3, 0, 1, 2]]
             scene.setJointPositions(q_start)
+            fixed_viz.display(q_start)
             preview_viz.display(q_goal_full)
             status_text.value = "Goal reset to the initial sampled pose."
 
@@ -591,8 +592,20 @@ def main(
                 toppra_elapsed = time.perf_counter() - toppra_start
                 fixed_viz.display(q_start)
                 visualizeJointTrajectory(
-                    fixed_viz, scene, traj, [ee_name], (0, 180, 0), "/constrained_rrt/path"
+                    preview_viz,
+                    scene,
+                    traj,
+                    [ee_name],
+                    (0, 120, 255),
+                    "/constrained_rrt/path_preview",
                 )
+
+                preview_viz.display(q_start)
+                for q in traj.positions:
+                    q_step_full = scene.toFullJointPositions(group_name, q)
+                    scene.setJointPositions(q_step_full)
+                    preview_viz.display(q_step_full)
+                    time.sleep(traj_dt)
 
                 total_elapsed = time.perf_counter() - plan_start
                 stats = (
@@ -635,11 +648,14 @@ def main(
                 _pump_matplotlib()
             elif animate and cur_traj is not None:
                 print("\nAnimating trajectory...")
+                fixed_viz.display(q_start)
                 for q in cur_traj.positions:
-                    preview_viz.display(scene.toFullJointPositions(group_name, q))
+                    q_step_full = scene.toFullJointPositions(group_name, q)
+                    scene.setJointPositions(q_step_full)
+                    fixed_viz.display(q_step_full)
                     time.sleep(traj_dt)
                     _pump_matplotlib()
-                preview_viz.display(q_start)
+                preview_viz.display(q_step_full)
                 animate = False
                 plan_button.disabled = False
                 animate_button.disabled = False
@@ -735,7 +751,12 @@ def main(
             toppra_elapsed = time.perf_counter() - toppra_start
             fixed_viz.display(q_start)
             visualizeJointTrajectory(
-                fixed_viz, scene, traj, [ee_name], (0, 180, 0), "/constrained_rrt/path"
+                preview_viz,
+                scene,
+                traj,
+                [ee_name],
+                (0, 120, 255),
+                "/constrained_rrt/path_preview",
             )
 
             total_elapsed = time.perf_counter() - plan_start
@@ -776,11 +797,14 @@ def main(
             _pump_matplotlib()
         elif animate and cur_traj is not None:
             print("\nAnimating trajectory...")
+            fixed_viz.display(q_start)
             for q in cur_traj.positions:
-                preview_viz.display(scene.toFullJointPositions(group_name, q))
+                q_step_full = scene.toFullJointPositions(group_name, q)
+                scene.setJointPositions(q_step_full)
+                fixed_viz.display(q_step_full)
                 time.sleep(traj_dt)
                 _pump_matplotlib()
-            preview_viz.display(q_start)
+            preview_viz.display(q_step_full)
             animate = False
             plan_button.disabled = False
             animate_button.disabled = False

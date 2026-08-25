@@ -196,6 +196,12 @@ PARAM_LABEL_ZH = {
     "rng_seed": "随机种子",
     "include_obstacles": "包含障碍物",
     "include_octrees": "包含八叉树",
+    "octree_pointcloud_topic": "点云 Topic",
+    "octree_voxel_resolution": "八叉树分辨率",
+    "octree_timeout_s": "点云等待超时",
+    "octree_max_points": "点云最大点数",
+    "octree_target_frame": "八叉树目标坐标系",
+    "octree_use_tf": "使用 TF 变换点云",
     "speed_mode": "速度模式",
     "max_linear_speed": "最大线速度",
     "max_angular_speed": "最大角速度",
@@ -285,6 +291,12 @@ ADVANCED_PARAMETER_NAMES = {
     "max_rotation_error",
     "max_shortcutting_iters",
     "max_tilt_degrees",
+    "octree_pointcloud_topic",
+    "octree_timeout_s",
+    "octree_voxel_resolution",
+    "octree_max_points",
+    "octree_target_frame",
+    "octree_use_tf",
     "path_corner_arc_step_deg",
     "path_corner_radius",
     "path_num_passes",
@@ -558,6 +570,12 @@ EXAMPLES: tuple[ExampleSpec, ...] = (
             ParameterSpec("rng_seed", "随机种子", "optional_int", None, 0, 2**31 - 1, 1),
             ParameterSpec("include_obstacles", "包含障碍物", "bool", False),
             ParameterSpec("include_octrees", "包含八叉树", "bool", False),
+            ParameterSpec("octree_pointcloud_topic", "点云 Topic", "str", "/camera/depth/points"),
+            ParameterSpec("octree_voxel_resolution", "八叉树分辨率", "float", 0.04, 0.001, 0.5, 0.005),
+            ParameterSpec("octree_timeout_s", "点云等待超时", "float", 5.0, 0.1, 60.0, 0.5),
+            ParameterSpec("octree_max_points", "点云最大点数", "int", 100000, 100, 2000000, 1000),
+            ParameterSpec("octree_target_frame", "八叉树目标坐标系", "str", "universe"),
+            ParameterSpec("octree_use_tf", "使用 TF 变换点云", "bool", False),
             *COMMON_VISER_PARAMS,
         ),
     ),
@@ -1182,14 +1200,14 @@ class ExamplePage(QWidget):
             return
 
         if confirm is not None:
-            reply = QMessageBox.question(
-                self,
-                f"{action_label}轨迹",
-                confirm,
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Question)
+            box.setWindowTitle(f"{action_label}轨迹")
+            box.setText(confirm)
+            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            box.setDefaultButton(QMessageBox.No)
+            box.setStyleSheet(self.styleSheet())
+            if box.exec() != QMessageBox.Yes:
                 return
 
         params = dict(self.param_values)
@@ -2043,6 +2061,16 @@ def main() -> int:
         }
         QDialog#ParameterDialog {
             background: rgba(247, 249, 252, 0.98);
+        }
+        QMessageBox {
+            background: rgba(247, 249, 252, 0.98);
+        }
+        QMessageBox QLabel {
+            color: #223243;
+            background: transparent;
+        }
+        QMessageBox QAbstractButton {
+            min-width: 92px;
         }
         QDialogButtonBox QPushButton {
             min-width: 116px;

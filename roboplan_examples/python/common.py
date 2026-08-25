@@ -1,5 +1,9 @@
 from dataclasses import dataclass
+import json
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 
 try:
     import coal
@@ -525,9 +529,119 @@ def load_octree_from_point_cloud(pointcloud_path: Path, voxel_resolution: float 
     # Access vertex data
     vertices = ply_data["vertex"]
     vertex_array = np.array([vertices["x"], vertices["y"], vertices["z"]]).T
-    octree = coal.makeOctree(vertex_array, voxel_resolution)
+    return load_octree_from_point_cloud_points(vertex_array, voxel_resolution)
 
-    return octree
+
+def load_octree_from_point_cloud_points(
+    points: np.ndarray,
+    voxel_resolution: float = 0.04,
+):
+    """Convert an in-memory XYZ point array into an octree."""
+    vertex_array = np.asarray(points, dtype=np.float64)
+    if vertex_array.ndim != 2 or vertex_array.shape[1] != 3:
+        raise ValueError("points must have shape (N, 3)")
+
+    finite_mask = np.all(np.isfinite(vertex_array), axis=1)
+    vertex_array = np.ascontiguousarray(vertex_array[finite_mask])
+    if len(vertex_array) == 0:
+        raise ValueError("point cloud is empty after filtering invalid points")
+
+    print(
+        f"Building octree from {len(vertex_array)} point(s) "
+        f"at {voxel_resolution:.3f} m resolution.",
+        flush=True,
+    )
+    return coal.makeOctree(vertex_array, voxel_resolution)
+
+
+def load_octree_from_ros2_point_cloud(
+    topic_name: str = "/camera/depth/points",
+    voxel_resolution: float = 0.04,
+    timeout_sec: float = 5.0,
+    target_frame: str = "universe",
+    octree_name: str = "octree_cloud",
+    max_points: int = 100000,
+    use_tf: bool = False,
+):
+    """Subscribe to a ROS 2 PointCloud2 topic and convert the latest cloud into an octree."""
+    snapshot_script = Path(__file__).with_name("ros2_pointcloud_snapshot.py")
+    with tempfile.TemporaryDirectory(prefix="roboplan_octree_") as tmpdir:
+        output_path = Path(tmpdir) / "points.npy"
+        command = [
+            sys.executable,
+            str(snapshot_script),
+            "--topic",
+            topic_name,
+            "--output",
+            str(output_path),
+            "--target-frame",
+            target_frame,
+            "--timeout",
+            str(timeout_sec),
+            "--voxel-resolution",
+            str(voxel_resolution),
+            "--max-points",
+            str(max_points),
+        ]
+        if not use_tf:
+            command.append("--no-tf")
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                cwd=str(snapshot_script.parent),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout_sec + 3.0,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(
+                f"Timed out waiting for ROS 2 point cloud snapshot from {topic_name}"
+            ) from exc
+
+        if completed.returncode != 0:
+            stderr = completed.stderr.strip()
+            stdout = completed.stdout.strip()
+            details = stderr or stdout or "no child-process output"
+            if completed.returncode < 0:
+                raise RuntimeError(
+                    f"ROS 2 point cloud snapshot process terminated by signal "
+                    f"{-completed.returncode}: {details}"
+                )
+            raise RuntimeError(
+                f"ROS 2 point cloud snapshot process exited with code "
+                f"{completed.returncode}: {details}"
+            )
+
+        stdout_text = completed.stdout.strip()
+        if stdout_text:
+            print(f"Point cloud snapshot: {stdout_text}", flush=True)
+            snapshot_info = None
+            for line in reversed(stdout_text.splitlines()):
+                try:
+                    snapshot_info = json.loads(line)
+                    break
+                except json.JSONDecodeError:
+                    continue
+            if snapshot_info is not None and not use_tf:
+                source_frame = snapshot_info.get("source_frame")
+                if source_frame and source_frame != target_frame:
+                    print(
+                        f"Warning: octree_use_tf is false, so points from "
+                        f"{source_frame} are interpreted directly in {target_frame}.",
+                        flush=True,
+                    )
+
+        points = np.load(output_path)
+
+    return ObstacleConfig(
+        name=octree_name,
+        geom=load_octree_from_point_cloud_points(points, voxel_resolution),
+        parent_frame="universe",
+        tform=pin.SE3(np.eye(3), np.zeros(3)).homogeneous,
+        color=np.array([0.251, 0.878, 0.816, 1.0]),
+    )
 
 
 def get_octree():

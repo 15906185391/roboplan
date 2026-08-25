@@ -266,7 +266,6 @@ def _run_interactive_cartesian_planning(
                 return False
 
             q_preview = scene.toFullJointPositions(group_name, solution.positions)
-            scene.setJointPositions(q_preview)
             preview_viz.display(q_preview)
             q_seed.positions = solution.positions
             status_text.value = "Target solved; planning can continue."
@@ -285,7 +284,7 @@ def _run_interactive_cartesian_planning(
             start_pose = scene.forwardKinematics(q_home_full, ee_name)
             controls.position = start_pose[:3, 3]
             controls.wxyz = pin.Quaternion(start_pose[:3, :3]).coeffs()[[3, 0, 1, 2]]
-        scene.setJointPositions(q_home_full)
+        fixed_viz.display(q_home_full)
         preview_viz.display(q_home_full)
         status_text.value = "Target reset to the home pose. Drag it or plan directly."
 
@@ -299,7 +298,7 @@ def _run_interactive_cartesian_planning(
 
         busy["plan"] = True
         try:
-            q_start_full = scene.getCurrentJointPositions()
+            q_start_full = q_home_full.copy()
             q_start = JointConfiguration()
             q_start.positions = q_start_full[q_indices].copy()
             path = make_lawnmower_path(
@@ -343,12 +342,12 @@ def _run_interactive_cartesian_planning(
             print(f"  Peak acceleration / limit: {peak_acceleration_ratio:.2f}")
 
             visualizeJointTrajectory(
-                fixed_viz,
+                preview_viz,
                 scene,
                 traj,
                 tip_frames,
-                color=(220, 40, 40),
-                name="/interactive_cartesian/actual_path",
+                color=(0, 120, 255),
+                name="/interactive_cartesian/preview_path",
             )
             fig = plotJointTrajectory(
                 traj,
@@ -360,7 +359,13 @@ def _run_interactive_cartesian_planning(
             )
             fig.canvas.draw()
             fig.canvas.flush_events()
-            status_text.value = "Planning complete. Use Animate once to replay the result."
+            preview_viz.display(q_home_full)
+            for q_group in traj.positions:
+                q_step_full = scene.toFullJointPositions(group_name, q_group)
+                preview_viz.display(q_step_full)
+                time.sleep(dt)
+
+            status_text.value = "Preview complete. Use Animate once to replay the result."
             animate_button.disabled = False
         finally:
             busy["plan"] = False
@@ -369,8 +374,10 @@ def _run_interactive_cartesian_planning(
     def animate_once(_):
         if last_traj is None:
             return
+        fixed_viz.display(q_home_full)
         for q_group in last_traj:
-            preview_viz.display(scene.toFullJointPositions(group_name, q_group))
+            q_step_full = scene.toFullJointPositions(group_name, q_group)
+            fixed_viz.display(q_step_full)
             time.sleep(dt)
 
     status_text.value = "Ready. Drag the target frame; IK runs when planning starts."
